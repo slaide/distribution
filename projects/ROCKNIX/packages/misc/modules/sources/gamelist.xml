@@ -494,4 +494,14 @@ it's recommended to have a mouse and keyboard to modify settings.</desc>
         <players>1</players>
         <image>./images/nfs.svg</image>
      </game>
+	<game>
+        <path>./Device Controls.sh</path>
+        <name>Device Controls</name>
+        <desc>On-device control panel for SM8750 handhelds: gamepad tester, audio, fan curve and system info, plus grip remap, stick RGB and motion where the hardware is present.</desc>
+        <developer>ROCKNIX</developer>
+        <publisher>ROCKNIX</publisher>
+        <rating>5.0</rating>
+        <releasedate>2026</releasedate>
+        <genre>tool</genre>
+	</game>
 </gameList>

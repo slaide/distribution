@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore saved KONKR grip mappings and stick RGB
+# The MCU key-configs are volatile across MCU power loss; re-apply the
+# user's saved mappings (written by device-controls "Save as boot config").
+ConditionPathExists=/storage/.config/device-controls.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/device-controls --restore
+
+[Install]
+WantedBy=multi-user.target
