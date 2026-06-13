@@ -1,0 +1,1175 @@
+iio: imu: add Qualcomm SSC IMU (sns_client over QRTR) driver
+
+New IIO driver exposing the accelerometer and gyroscope managed by the
+Snapdragon Sensor Core sensor framework ("SEE") on the ADSP. On SM8750
+there is no SLPI; the SSC and the ICM-4x6xx driver live inside the ADSP
+firmware and are reached through the sns_client QMI service (id 400) on
+QRTR, whose payload is a protobuf sns_client request/event stream.
+
+The driver is an in-kernel QMI client (qmi_helpers): it lookup-tracks the
+service (which appears only after a userspace FastRPC daemon serves the
+sensor registry to the PD, possibly long after boot, and across ADSP
+restarts), discovers the accel/gyro SUIDs, enables continuous streaming,
+and pushes samples into a standard IIO kfifo buffer. A small hand-rolled
+protobuf codec encodes the requests and decodes the float sample events;
+IEEE-754 values are converted to micro-SI integers without using the FPU.
+
+Channels: accel x/y/z (IIO_ACCEL), anglvel x/y/z (IIO_ANGL_VEL), soft
+timestamp. Raw values are micro-m/s^2 and micro-rad/s (scale 1e-6).
+Sample rate is settable via sampling_frequency (default 100 Hz).
+
+Wired in as a faux_device (no DT node; the QRTR service is the resource).
+
+---
+--- a/drivers/iio/imu/Kconfig	2026-06-12 01:27:23.666130586 +0200
++++ b/drivers/iio/imu/Kconfig	2026-06-12 01:27:23.647811275 +0200
+@@ -112,6 +112,20 @@
+ source "drivers/iio/imu/inv_icm45600/Kconfig"
+ source "drivers/iio/imu/inv_mpu6050/Kconfig"
+ 
++config QCOM_SSC_IMU
++	tristate "Qualcomm Snapdragon Sensor Core IMU (sns_client over QRTR)"
++	depends on QRTR
++	select QCOM_QMI_HELPERS
++	select IIO_BUFFER
++	select IIO_KFIFO_BUF
++	help
++	  Say yes here to expose the accelerometer and gyroscope managed by
++	  the Snapdragon Sensor Core (SSC) sensor framework on the ADSP as a
++	  standard IIO device, using the sns_client QMI service over QRTR.
++
++	  This driver can also be built as a module. If so, the module will
++	  be called qcom_ssc_imu.
++
+ config SMI240
+ 	tristate "Bosch Sensor SMI240 Inertial Measurement Unit"
+ 	depends on SPI
+--- a/drivers/iio/imu/Makefile	2026-06-12 01:27:23.666172625 +0200
++++ b/drivers/iio/imu/Makefile	2026-06-12 01:27:23.649551360 +0200
+@@ -30,6 +30,8 @@
+ 
+ obj-$(CONFIG_KMX61) += kmx61.o
+ 
++obj-$(CONFIG_QCOM_SSC_IMU) += qcom_ssc_imu.o
++
+ obj-$(CONFIG_SMI240) += smi240.o
+ 
+ obj-y += smi330/
+--- /dev/null
++++ b/drivers/iio/imu/qcom_ssc_imu.c
+@@ -0,0 +1,1115 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * IIO driver for IMU sensors on the Qualcomm Snapdragon Sensor Core (SSC).
++ *
++ * On SoCs where the SSC is hosted on the ADSP (e.g. SM8750), the sensor
++ * framework ("SEE") inside the ADSP firmware exposes sensors through the
++ * sns_client QMI service (id 400) on QRTR.  The QMI message payload is a
++ * protobuf-encoded sns_client request/event stream.  This driver speaks
++ * just enough of that protocol to discover the accelerometer and
++ * gyroscope SUIDs and stream their samples, exposing them as a standard
++ * IIO device.
++ *
++ * The protobuf subset is hand-encoded/decoded; values arrive as IEEE-754
++ * floats in SI units (m/s^2, rad/s) and are converted to micro-units
++ * integers without using floating point.
++ *
++ * Note that the sensor PD on the ADSP only starts once a FastRPC
++ * remote-filesystem daemon (hexagonrpcd) serves it the sensor registry,
++ * so the service may appear long after boot; discovery is fully
++ * lookup-driven and survives ADSP restarts.
++ */
++
++#include <linux/bitops.h>
++#include <linux/device/faux.h>
++#include <linux/iio/buffer.h>
++#include <linux/iio/iio.h>
++#include <linux/iio/kfifo_buf.h>
++#include <linux/kernel.h>
++#include <linux/math64.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/soc/qcom/qmi.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#define SSC_QMI_SVC_ID		400
++#define SSC_QMI_SVC_VERSION	1
++#define SSC_QMI_CTRL_MSG	0x0020
++#define SSC_QMI_IND_SMALL	0x0021
++#define SSC_QMI_IND_LARGE	0x0022
++
++#define SSC_REQ_MAX		128
++#define SSC_IND_MAX		8192
++
++/* Well-known SUID of the SUID-lookup sensor itself */
++#define SSC_SUID_SENSOR_LOW	0xababababababababULL
++#define SSC_SUID_SENSOR_HIGH	0xababababababababULL
++
++/* sns_client message ids */
++#define SSC_MSG_SUID_REQ	512
++#define SSC_MSG_SUID_RESP	768
++#define SSC_MSG_ENABLE		513
++#define SSC_MSG_DISABLE		10
++#define SSC_MSG_EVENT		1025
++
++#define SSC_DEFAULT_RATE_HZ	100
++#define SSC_LOOKUP_RETRY	(10 * HZ)
++
++/* DSP timestamps tick at 19.2 MHz: ns = ticks * 625 / 12 */
++#define SSC_TICK_MUL		625
++#define SSC_TICK_DIV		12
++
++/*
++ * QMI marshalling: one request message carrying an opaque protobuf, and
++ * two indication flavours carrying an opaque protobuf back.
++ */
++
++struct ssc_ctrl_req {
++	u32 data_len;
++	u8 data[SSC_REQ_MAX];
++	u8 report_type_valid;
++	u8 report_type;
++};
++
++static const struct qmi_elem_info ssc_ctrl_req_ei[] = {
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u16),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ssc_ctrl_req, data_len),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= SSC_REQ_MAX,
++		.elem_size	= sizeof(u8),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ssc_ctrl_req, data),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ssc_ctrl_req, report_type_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ssc_ctrl_req, report_type),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++struct ssc_ctrl_resp {
++	struct qmi_response_type_v01 resp;
++	u8 client_id_valid;
++	u64 client_id;
++	u8 result_valid;
++	u32 result;
++};
++
++static const struct qmi_elem_info ssc_ctrl_resp_ei[] = {
++	{
++		.data_type	= QMI_STRUCT,
++		.elem_len	= 1,
++		.elem_size	= sizeof(struct qmi_response_type_v01),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct ssc_ctrl_resp, resp),
++		.ei_array	= qmi_response_type_v01_ei,
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ssc_ctrl_resp, client_id_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u64),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x10,
++		.offset		= offsetof(struct ssc_ctrl_resp, client_id),
++	},
++	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct ssc_ctrl_resp, result_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u32),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct ssc_ctrl_resp, result),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++struct ssc_report_ind {
++	u64 client_id;
++	u32 data_len;
++	u8 data[SSC_IND_MAX];
++};
++
++static const struct qmi_elem_info ssc_report_ind_ei[] = {
++	{
++		.data_type	= QMI_UNSIGNED_8_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u64),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x01,
++		.offset		= offsetof(struct ssc_report_ind, client_id),
++	},
++	{
++		.data_type	= QMI_DATA_LEN,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u16),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct ssc_report_ind, data_len),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= SSC_IND_MAX,
++		.elem_size	= sizeof(u8),
++		.array_type	= VAR_LEN_ARRAY,
++		.tlv_type	= 0x02,
++		.offset		= offsetof(struct ssc_report_ind, data),
++	},
++	{
++		.data_type	= QMI_EOTI,
++	},
++};
++
++struct ssc_imu {
++	struct iio_dev *indio_dev;
++	struct device *dev;
++
++	struct qmi_handle qmi;
++
++	/* protects everything below */
++	struct mutex lock;
++	struct sockaddr_qrtr sq;
++	bool have_service;
++	bool dying;
++	u64 accel_suid_low, accel_suid_high;
++	u64 gyro_suid_low, gyro_suid_high;
++	bool accel_found, gyro_found;
++	bool accel_enabled, gyro_enabled;
++	unsigned int sample_rate;
++
++	struct workqueue_struct *wq;
++	struct delayed_work lookup_work;
++	struct work_struct enable_work;
++
++	/* protects val[] */
++	spinlock_t data_lock;
++	s32 val[6];	/* accel x/y/z, anglvel x/y/z, in micro-SI-units */
++
++	/* only touched from the qmi handler thread */
++	struct {
++		s32 ch[6];
++		aligned_s64 ts;
++	} scan;
++};
++
++/*
++ * Minimal protobuf wire helpers (proto2).  Wire types: 0 = varint,
++ * 1 = 64-bit, 2 = length-delimited, 5 = 32-bit.
++ */
++
++struct ssc_pb_writer {
++	u8 *buf;
++	unsigned int len;
++	unsigned int cap;
++	bool overflow;
++};
++
++static void pb_put_u8(struct ssc_pb_writer *w, u8 b)
++{
++	if (w->len < w->cap)
++		w->buf[w->len] = b;
++	else
++		w->overflow = true;
++	w->len++;
++}
++
++static void pb_put_varint(struct ssc_pb_writer *w, u64 v)
++{
++	do {
++		u8 b = v & 0x7f;
++
++		v >>= 7;
++		if (v)
++			b |= 0x80;
++		pb_put_u8(w, b);
++	} while (v);
++}
++
++static void pb_put_tag(struct ssc_pb_writer *w, u32 field, u32 wire)
++{
++	pb_put_varint(w, ((u64)field << 3) | wire);
++}
++
++static void pb_put_fixed32(struct ssc_pb_writer *w, u32 v)
++{
++	int i;
++
++	for (i = 0; i < 4; i++)
++		pb_put_u8(w, (v >> (8 * i)) & 0xff);
++}
++
++static void pb_put_fixed64(struct ssc_pb_writer *w, u64 v)
++{
++	int i;
++
++	for (i = 0; i < 8; i++)
++		pb_put_u8(w, (v >> (8 * i)) & 0xff);
++}
++
++struct ssc_pb_reader {
++	const u8 *p;
++	const u8 *end;
++};
++
++static int pb_get_varint(struct ssc_pb_reader *r, u64 *v)
++{
++	int shift = 0;
++
++	*v = 0;
++	while (r->p < r->end && shift < 64) {
++		u8 b = *r->p++;
++
++		*v |= (u64)(b & 0x7f) << shift;
++		if (!(b & 0x80))
++			return 0;
++		shift += 7;
++	}
++	return -EBADMSG;
++}
++
++static int pb_get_tag(struct ssc_pb_reader *r, u32 *field, u32 *wire)
++{
++	u64 v;
++	int ret;
++
++	if (r->p >= r->end)
++		return -ENODATA;
++	ret = pb_get_varint(r, &v);
++	if (ret)
++		return ret;
++	*field = v >> 3;
++	*wire = v & 7;
++	return 0;
++}
++
++static int pb_get_fixed32(struct ssc_pb_reader *r, u32 *v)
++{
++	if (r->end - r->p < 4)
++		return -EBADMSG;
++	*v = get_unaligned_le32(r->p);
++	r->p += 4;
++	return 0;
++}
++
++static int pb_get_fixed64(struct ssc_pb_reader *r, u64 *v)
++{
++	if (r->end - r->p < 8)
++		return -EBADMSG;
++	*v = get_unaligned_le64(r->p);
++	r->p += 8;
++	return 0;
++}
++
++static int pb_get_bytes(struct ssc_pb_reader *r, const u8 **data, size_t *len)
++{
++	u64 l;
++	int ret;
++
++	ret = pb_get_varint(r, &l);
++	if (ret)
++		return ret;
++	if (l > (u64)(r->end - r->p))
++		return -EBADMSG;
++	*data = r->p;
++	*len = l;
++	r->p += l;
++	return 0;
++}
++
++static int pb_skip(struct ssc_pb_reader *r, u32 wire)
++{
++	u64 v;
++	const u8 *d;
++	size_t l;
++	u32 v32;
++
++	switch (wire) {
++	case 0:
++		return pb_get_varint(r, &v);
++	case 1:
++		return pb_get_fixed64(r, &v);
++	case 2:
++		return pb_get_bytes(r, &d, &l);
++	case 5:
++		return pb_get_fixed32(r, &v32);
++	default:
++		return -EBADMSG;
++	}
++}
++
++/*
++ * IEEE-754 binary32 <-> integer conversions, no FPU.
++ */
++
++static s32 ssc_f32_to_micro(u32 bits)
++{
++	u32 exp = (bits >> 23) & 0xff;
++	u64 mant = bits & GENMASK(22, 0);
++	s64 v;
++	int e;
++
++	if (exp == 0xff)	/* inf/nan */
++		return 0;
++	if (exp == 0) {
++		if (!mant)
++			return 0;
++		e = -149;
++	} else {
++		mant |= BIT(23);
++		e = (int)exp - 150;
++	}
++
++	v = mant * 1000000LL;	/* < 2^44, no overflow */
++	if (e >= 0) {
++		if (e > 19)	/* would exceed s64 */
++			v = S64_MAX;
++		else
++			v <<= e;
++	} else {
++		if (e < -63)
++			v = 0;
++		else
++			v >>= -e;
++	}
++
++	v = clamp_t(s64, v, S32_MIN, S32_MAX);
++	return (bits & BIT(31)) ? -(s32)v : (s32)v;
++}
++
++static u32 ssc_u32_to_f32(u32 v)
++{
++	u32 mant;
++	int p;
++
++	if (!v)
++		return 0;
++	p = fls(v) - 1;
++	if (p <= 23)
++		mant = v << (23 - p);
++	else
++		mant = v >> (p - 23);
++	return ((u32)(127 + p) << 23) | (mant & GENMASK(22, 0));
++}
++
++/*
++ * Send one sns_client request: a SscClientRequest protobuf wrapped in the
++ * QMI control message.  Must not be called from the QMI handler thread
++ * (it waits for the transaction response on that thread).
++ */
++static int ssc_imu_send(struct ssc_imu *st, struct sockaddr_qrtr *sq,
++			u64 suid_low, u64 suid_high, u32 msg_id,
++			const u8 *payload, size_t plen)
++{
++	struct ssc_ctrl_req *req;
++	struct ssc_ctrl_resp resp = {};
++	struct ssc_pb_writer w;
++	struct qmi_txn txn;
++	int ret;
++
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	w = (struct ssc_pb_writer){ .buf = req->data, .cap = SSC_REQ_MAX };
++
++	/* 1: suid { 1: fixed64 low, 2: fixed64 high } */
++	pb_put_tag(&w, 1, 2);
++	pb_put_varint(&w, 18);
++	pb_put_tag(&w, 1, 1);
++	pb_put_fixed64(&w, suid_low);
++	pb_put_tag(&w, 2, 1);
++	pb_put_fixed64(&w, suid_high);
++
++	/* 2: fixed32 msg_id */
++	pb_put_tag(&w, 2, 5);
++	pb_put_fixed32(&w, msg_id);
++
++	/* 3: susp_config { 1: client_proc_type = APSS(1), 2: delivery = WAKEUP(0) } */
++	pb_put_tag(&w, 3, 2);
++	pb_put_varint(&w, 4);
++	pb_put_u8(&w, 0x08);
++	pb_put_u8(&w, 0x01);
++	pb_put_u8(&w, 0x10);
++	pb_put_u8(&w, 0x00);
++
++	/* 4: request { 2: bytes payload } */
++	pb_put_tag(&w, 4, 2);
++	if (payload && plen) {
++		pb_put_varint(&w, plen + 2);
++		pb_put_tag(&w, 2, 2);
++		pb_put_varint(&w, plen);
++		while (plen--)
++			pb_put_u8(&w, *payload++);
++	} else {
++		pb_put_varint(&w, 0);
++	}
++
++	if (w.overflow) {
++		ret = -EMSGSIZE;
++		goto out;
++	}
++
++	req->data_len = w.len;
++	req->report_type_valid = 1;
++	req->report_type = 1;	/* large */
++
++	ret = qmi_txn_init(&st->qmi, &txn, ssc_ctrl_resp_ei, &resp);
++	if (ret < 0)
++		goto out;
++
++	ret = qmi_send_request(&st->qmi, sq, &txn, SSC_QMI_CTRL_MSG,
++			       sizeof(*req) + 16, ssc_ctrl_req_ei, req);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		goto out;
++	}
++
++	ret = qmi_txn_wait(&txn, 5 * HZ);
++	if (ret < 0)
++		goto out;
++
++	if (resp.resp.result) {
++		dev_warn_ratelimited(st->dev,
++				     "request msg_id %u failed: %u/%u\n",
++				     msg_id, resp.resp.result, resp.resp.error);
++		ret = -EREMOTEIO;
++	}
++out:
++	kfree(req);
++	return ret;
++}
++
++static int ssc_imu_lookup_suid(struct ssc_imu *st, struct sockaddr_qrtr *sq,
++			       const char *data_type)
++{
++	u8 payload[32];
++	struct ssc_pb_writer w = { .buf = payload, .cap = sizeof(payload) };
++	size_t len = strlen(data_type);
++
++	/* SscSuidReq { 1: string data_type, 2: register_updates = false,
++	 *              3: default_only = true } */
++	pb_put_tag(&w, 1, 2);
++	pb_put_varint(&w, len);
++	while (len--)
++		pb_put_u8(&w, *data_type++);
++	pb_put_tag(&w, 2, 0);
++	pb_put_varint(&w, 0);
++	pb_put_tag(&w, 3, 0);
++	pb_put_varint(&w, 1);
++
++	if (w.overflow)
++		return -EMSGSIZE;
++
++	return ssc_imu_send(st, sq, SSC_SUID_SENSOR_LOW, SSC_SUID_SENSOR_HIGH,
++			    SSC_MSG_SUID_REQ, payload, w.len);
++}
++
++static int ssc_imu_enable_sensor(struct ssc_imu *st, struct sockaddr_qrtr *sq,
++				 u64 suid_low, u64 suid_high,
++				 unsigned int rate_hz)
++{
++	u8 payload[8];
++	struct ssc_pb_writer w = { .buf = payload, .cap = sizeof(payload) };
++
++	/* SscStdSensorConfig { 1: float sample_rate } */
++	pb_put_tag(&w, 1, 5);
++	pb_put_fixed32(&w, ssc_u32_to_f32(rate_hz));
++
++	return ssc_imu_send(st, sq, suid_low, suid_high, SSC_MSG_ENABLE,
++			    payload, w.len);
++}
++
++static void ssc_imu_lookup_work(struct work_struct *work)
++{
++	struct ssc_imu *st = container_of(work, struct ssc_imu,
++					  lookup_work.work);
++	struct sockaddr_qrtr sq;
++	bool need_accel, need_gyro;
++
++	mutex_lock(&st->lock);
++	if (!st->have_service || st->dying) {
++		mutex_unlock(&st->lock);
++		return;
++	}
++	sq = st->sq;
++	need_accel = !st->accel_found;
++	need_gyro = !st->gyro_found;
++	mutex_unlock(&st->lock);
++
++	if (need_accel)
++		ssc_imu_lookup_suid(st, &sq, "accel");
++	if (need_gyro)
++		ssc_imu_lookup_suid(st, &sq, "gyro");
++
++	/* responses arrive asynchronously; retry until both are known */
++	mutex_lock(&st->lock);
++	if (st->have_service && !st->dying &&
++	    (!st->accel_found || !st->gyro_found))
++		queue_delayed_work(st->wq, &st->lookup_work, SSC_LOOKUP_RETRY);
++	mutex_unlock(&st->lock);
++}
++
++static void ssc_imu_enable_work(struct work_struct *work)
++{
++	struct ssc_imu *st = container_of(work, struct ssc_imu, enable_work);
++	struct sockaddr_qrtr sq;
++	u64 alo, ahi, glo, ghi;
++	unsigned int rate;
++	bool do_accel, do_gyro;
++	int ret;
++
++	mutex_lock(&st->lock);
++	if (!st->have_service || st->dying) {
++		mutex_unlock(&st->lock);
++		return;
++	}
++	sq = st->sq;
++	rate = st->sample_rate;
++	do_accel = st->accel_found && !st->accel_enabled;
++	do_gyro = st->gyro_found && !st->gyro_enabled;
++	alo = st->accel_suid_low;
++	ahi = st->accel_suid_high;
++	glo = st->gyro_suid_low;
++	ghi = st->gyro_suid_high;
++	mutex_unlock(&st->lock);
++
++	if (do_accel) {
++		ret = ssc_imu_enable_sensor(st, &sq, alo, ahi, rate);
++		if (!ret) {
++			mutex_lock(&st->lock);
++			st->accel_enabled = true;
++			mutex_unlock(&st->lock);
++			dev_info(st->dev, "accel streaming at %u Hz\n", rate);
++		}
++	}
++	if (do_gyro) {
++		ret = ssc_imu_enable_sensor(st, &sq, glo, ghi, rate);
++		if (!ret) {
++			mutex_lock(&st->lock);
++			st->gyro_enabled = true;
++			mutex_unlock(&st->lock);
++			dev_info(st->dev, "gyro streaming at %u Hz\n", rate);
++		}
++	}
++}
++
++/*
++ * Indication parsing.  The protobuf is a SscClientEvent:
++ *   1: suid { 1: fixed64 low, 2: fixed64 high }
++ *   2: repeated event { 1: fixed32 msg_id, 2: fixed64 timestamp, 3: bytes }
++ */
++
++static void ssc_imu_handle_suid_resp(struct ssc_imu *st, const u8 *data,
++				     size_t len)
++{
++	struct ssc_pb_reader r = { data, data + len };
++	const char *dt = NULL;
++	size_t dt_len = 0;
++	u64 lo = 0, hi = 0;
++	bool have_uid = false;
++	u32 field, wire;
++
++	while (!pb_get_tag(&r, &field, &wire)) {
++		if (field == 1 && wire == 2) {
++			const u8 *s;
++			size_t l;
++
++			if (pb_get_bytes(&r, &s, &l))
++				return;
++			dt = (const char *)s;
++			dt_len = l;
++		} else if (field == 2 && wire == 2 && !have_uid) {
++			const u8 *s;
++			size_t l;
++			struct ssc_pb_reader sub;
++			u32 f2, w2;
++
++			if (pb_get_bytes(&r, &s, &l))
++				return;
++			sub = (struct ssc_pb_reader){ s, s + l };
++			while (!pb_get_tag(&sub, &f2, &w2)) {
++				if (f2 == 1 && w2 == 1) {
++					if (pb_get_fixed64(&sub, &lo))
++						return;
++				} else if (f2 == 2 && w2 == 1) {
++					if (pb_get_fixed64(&sub, &hi))
++						return;
++				} else if (pb_skip(&sub, w2)) {
++					return;
++				}
++			}
++			have_uid = true;
++		} else if (pb_skip(&r, wire)) {
++			return;
++		}
++	}
++
++	if (!dt || !have_uid)
++		return;
++
++	mutex_lock(&st->lock);
++	if (dt_len == 5 && !memcmp(dt, "accel", 5) && !st->accel_found) {
++		st->accel_suid_low = lo;
++		st->accel_suid_high = hi;
++		st->accel_found = true;
++		dev_info(st->dev, "accel suid %016llx%016llx\n", hi, lo);
++	} else if (dt_len == 4 && !memcmp(dt, "gyro", 4) && !st->gyro_found) {
++		st->gyro_suid_low = lo;
++		st->gyro_suid_high = hi;
++		st->gyro_found = true;
++		dev_info(st->dev, "gyro suid %016llx%016llx\n", hi, lo);
++	}
++	if (!st->dying && (st->accel_found || st->gyro_found))
++		queue_work(st->wq, &st->enable_work);
++	mutex_unlock(&st->lock);
++}
++
++static int ssc_imu_parse_floats(const u8 *data, size_t len, s32 *out,
++				int max_out)
++{
++	struct ssc_pb_reader r = { data, data + len };
++	u32 field, wire;
++	int n = 0;
++
++	while (!pb_get_tag(&r, &field, &wire)) {
++		if (field == 1 && wire == 5) {
++			u32 bits;
++
++			if (pb_get_fixed32(&r, &bits))
++				return n;
++			if (n < max_out)
++				out[n++] = ssc_f32_to_micro(bits);
++		} else if (field == 1 && wire == 2) {
++			/* packed encoding */
++			const u8 *s;
++			size_t l;
++
++			if (pb_get_bytes(&r, &s, &l))
++				return n;
++			while (l >= 4 && n < max_out) {
++				out[n++] = ssc_f32_to_micro(get_unaligned_le32(s));
++				s += 4;
++				l -= 4;
++			}
++		} else if (pb_skip(&r, wire)) {
++			return n;
++		}
++	}
++	return n;
++}
++
++static void ssc_imu_handle_sample(struct ssc_imu *st, bool is_gyro,
++				  const u8 *data, size_t len, u64 ticks)
++{
++	struct iio_dev *indio_dev = st->indio_dev;
++	s32 vals[3] = {};
++	bool push;
++	int n;
++
++	n = ssc_imu_parse_floats(data, len, vals, 3);
++	if (n < 3)
++		return;
++
++	spin_lock(&st->data_lock);
++	memcpy(&st->val[is_gyro ? 3 : 0], vals, sizeof(vals));
++	spin_unlock(&st->data_lock);
++
++	/*
++	 * Push one scan per primary-sensor event: the gyro when present,
++	 * otherwise the accelerometer.
++	 */
++	mutex_lock(&st->lock);
++	push = is_gyro || !st->gyro_found;
++	mutex_unlock(&st->lock);
++
++	if (push && iio_buffer_enabled(indio_dev)) {
++		spin_lock(&st->data_lock);
++		memcpy(st->scan.ch, st->val, sizeof(st->scan.ch));
++		spin_unlock(&st->data_lock);
++		iio_push_to_buffers_with_timestamp(indio_dev, &st->scan,
++				mul_u64_u32_div(ticks, SSC_TICK_MUL,
++						SSC_TICK_DIV));
++	}
++}
++
++static void ssc_imu_report_cb(struct qmi_handle *qmi, struct sockaddr_qrtr *sq,
++			      struct qmi_txn *txn, const void *data)
++{
++	struct ssc_imu *st = container_of(qmi, struct ssc_imu, qmi);
++	const struct ssc_report_ind *ind = data;
++	struct ssc_pb_reader r = { ind->data, ind->data + ind->data_len };
++	u64 uid_lo = 0, uid_hi = 0;
++	u32 field, wire;
++
++	if (ind->data_len > SSC_IND_MAX)
++		return;
++
++	while (!pb_get_tag(&r, &field, &wire)) {
++		if (field == 1 && wire == 2) {
++			const u8 *s;
++			size_t l;
++			struct ssc_pb_reader sub;
++			u32 f2, w2;
++
++			if (pb_get_bytes(&r, &s, &l))
++				return;
++			sub = (struct ssc_pb_reader){ s, s + l };
++			while (!pb_get_tag(&sub, &f2, &w2)) {
++				if (f2 == 1 && w2 == 1) {
++					if (pb_get_fixed64(&sub, &uid_lo))
++						return;
++				} else if (f2 == 2 && w2 == 1) {
++					if (pb_get_fixed64(&sub, &uid_hi))
++						return;
++				} else if (pb_skip(&sub, w2)) {
++					return;
++				}
++			}
++		} else if (field == 2 && wire == 2) {
++			const u8 *s;
++			size_t l;
++			struct ssc_pb_reader ev;
++			u32 f2, w2;
++			u32 msg_id = 0;
++			u64 ts = 0;
++			const u8 *msg = NULL;
++			size_t mlen = 0;
++
++			if (pb_get_bytes(&r, &s, &l))
++				return;
++			ev = (struct ssc_pb_reader){ s, s + l };
++			while (!pb_get_tag(&ev, &f2, &w2)) {
++				if (f2 == 1 && w2 == 5) {
++					if (pb_get_fixed32(&ev, &msg_id))
++						return;
++				} else if (f2 == 2 && w2 == 1) {
++					if (pb_get_fixed64(&ev, &ts))
++						return;
++				} else if (f2 == 3 && w2 == 2) {
++					if (pb_get_bytes(&ev, &msg, &mlen))
++						return;
++				} else if (pb_skip(&ev, w2)) {
++					return;
++				}
++			}
++
++			if (!msg)
++				continue;
++
++			if (uid_lo == SSC_SUID_SENSOR_LOW &&
++			    uid_hi == SSC_SUID_SENSOR_HIGH &&
++			    msg_id == SSC_MSG_SUID_RESP) {
++				ssc_imu_handle_suid_resp(st, msg, mlen);
++			} else if (msg_id == SSC_MSG_EVENT) {
++				bool is_accel, is_gyro;
++
++				mutex_lock(&st->lock);
++				is_accel = st->accel_found &&
++					   uid_lo == st->accel_suid_low &&
++					   uid_hi == st->accel_suid_high;
++				is_gyro = st->gyro_found &&
++					  uid_lo == st->gyro_suid_low &&
++					  uid_hi == st->gyro_suid_high;
++				mutex_unlock(&st->lock);
++
++				if (is_accel || is_gyro)
++					ssc_imu_handle_sample(st, is_gyro,
++							      msg, mlen, ts);
++			}
++		} else if (pb_skip(&r, wire)) {
++			return;
++		}
++	}
++}
++
++static int ssc_imu_new_server(struct qmi_handle *qmi, struct qmi_service *svc)
++{
++	struct ssc_imu *st = container_of(qmi, struct ssc_imu, qmi);
++
++	mutex_lock(&st->lock);
++	st->sq = (struct sockaddr_qrtr){
++		.sq_family = AF_QIPCRTR,
++		.sq_node = svc->node,
++		.sq_port = svc->port,
++	};
++	st->have_service = true;
++	st->accel_found = false;
++	st->gyro_found = false;
++	st->accel_enabled = false;
++	st->gyro_enabled = false;
++	if (!st->dying)
++		queue_delayed_work(st->wq, &st->lookup_work, 0);
++	mutex_unlock(&st->lock);
++
++	dev_info(st->dev, "sns_client service on node %u port %u\n",
++		 svc->node, svc->port);
++	return 0;
++}
++
++static void ssc_imu_del_server(struct qmi_handle *qmi, struct qmi_service *svc)
++{
++	struct ssc_imu *st = container_of(qmi, struct ssc_imu, qmi);
++
++	mutex_lock(&st->lock);
++	st->have_service = false;
++	st->accel_found = false;
++	st->gyro_found = false;
++	st->accel_enabled = false;
++	st->gyro_enabled = false;
++	mutex_unlock(&st->lock);
++
++	dev_info(st->dev, "sns_client service lost\n");
++}
++
++static const struct qmi_ops ssc_imu_qmi_ops = {
++	.new_server = ssc_imu_new_server,
++	.del_server = ssc_imu_del_server,
++};
++
++static const struct qmi_msg_handler ssc_imu_qmi_handlers[] = {
++	{
++		.type = QMI_INDICATION,
++		.msg_id = SSC_QMI_IND_SMALL,
++		.ei = ssc_report_ind_ei,
++		.decoded_size = sizeof(struct ssc_report_ind),
++		.fn = ssc_imu_report_cb,
++	},
++	{
++		.type = QMI_INDICATION,
++		.msg_id = SSC_QMI_IND_LARGE,
++		.ei = ssc_report_ind_ei,
++		.decoded_size = sizeof(struct ssc_report_ind),
++		.fn = ssc_imu_report_cb,
++	},
++	{},
++};
++
++/* IIO */
++
++#define SSC_IMU_CHANNEL(_type, _mod, _idx)			\
++{								\
++	.type = _type,						\
++	.modified = 1,						\
++	.channel2 = _mod,					\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),		\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
++	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),\
++	.scan_index = _idx,					\
++	.scan_type = {						\
++		.sign = 's',					\
++		.realbits = 32,					\
++		.storagebits = 32,				\
++		.endianness = IIO_CPU,				\
++	},							\
++}
++
++static const struct iio_chan_spec ssc_imu_channels[] = {
++	SSC_IMU_CHANNEL(IIO_ACCEL, IIO_MOD_X, 0),
++	SSC_IMU_CHANNEL(IIO_ACCEL, IIO_MOD_Y, 1),
++	SSC_IMU_CHANNEL(IIO_ACCEL, IIO_MOD_Z, 2),
++	SSC_IMU_CHANNEL(IIO_ANGL_VEL, IIO_MOD_X, 3),
++	SSC_IMU_CHANNEL(IIO_ANGL_VEL, IIO_MOD_Y, 4),
++	SSC_IMU_CHANNEL(IIO_ANGL_VEL, IIO_MOD_Z, 5),
++	IIO_CHAN_SOFT_TIMESTAMP(6),
++};
++
++static const unsigned long ssc_imu_scan_masks[] = { GENMASK(5, 0), 0 };
++
++static int ssc_imu_read_raw(struct iio_dev *indio_dev,
++			    struct iio_chan_spec const *chan,
++			    int *val, int *val2, long mask)
++{
++	struct ssc_imu *st = iio_priv(indio_dev);
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		if (chan->scan_index < 0 || chan->scan_index > 5)
++			return -EINVAL;
++		spin_lock(&st->data_lock);
++		*val = st->val[chan->scan_index];
++		spin_unlock(&st->data_lock);
++		return IIO_VAL_INT;
++	case IIO_CHAN_INFO_SCALE:
++		/* raw values are micro-(m/s^2 | rad/s) */
++		*val = 0;
++		*val2 = 1;
++		return IIO_VAL_INT_PLUS_MICRO;
++	case IIO_CHAN_INFO_SAMP_FREQ:
++		mutex_lock(&st->lock);
++		*val = st->sample_rate;
++		mutex_unlock(&st->lock);
++		return IIO_VAL_INT;
++	default:
++		return -EINVAL;
++	}
++}
++
++static int ssc_imu_write_raw(struct iio_dev *indio_dev,
++			     struct iio_chan_spec const *chan,
++			     int val, int val2, long mask)
++{
++	struct ssc_imu *st = iio_priv(indio_dev);
++
++	switch (mask) {
++	case IIO_CHAN_INFO_SAMP_FREQ:
++		if (val < 1 || val > 1000 || val2)
++			return -EINVAL;
++		mutex_lock(&st->lock);
++		st->sample_rate = val;
++		st->accel_enabled = false;
++		st->gyro_enabled = false;
++		if (!st->dying)
++			queue_work(st->wq, &st->enable_work);
++		mutex_unlock(&st->lock);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++
++static const struct iio_info ssc_imu_info = {
++	.read_raw = ssc_imu_read_raw,
++	.write_raw = ssc_imu_write_raw,
++};
++
++static void ssc_imu_qmi_teardown(void *data)
++{
++	struct ssc_imu *st = data;
++
++	mutex_lock(&st->lock);
++	st->dying = true;
++	mutex_unlock(&st->lock);
++
++	cancel_delayed_work_sync(&st->lookup_work);
++	cancel_work_sync(&st->enable_work);
++	qmi_handle_release(&st->qmi);
++}
++
++static void ssc_imu_destroy_wq(void *data)
++{
++	struct ssc_imu *st = data;
++
++	destroy_workqueue(st->wq);
++}
++
++static int ssc_imu_probe(struct faux_device *fdev)
++{
++	struct device *dev = &fdev->dev;
++	struct iio_dev *indio_dev;
++	struct ssc_imu *st;
++	int ret;
++
++	indio_dev = devm_iio_device_alloc(dev, sizeof(*st));
++	if (!indio_dev)
++		return -ENOMEM;
++
++	st = iio_priv(indio_dev);
++	st->indio_dev = indio_dev;
++	st->dev = dev;
++	st->sample_rate = SSC_DEFAULT_RATE_HZ;
++	mutex_init(&st->lock);
++	spin_lock_init(&st->data_lock);
++	INIT_DELAYED_WORK(&st->lookup_work, ssc_imu_lookup_work);
++	INIT_WORK(&st->enable_work, ssc_imu_enable_work);
++
++	st->wq = alloc_ordered_workqueue("ssc_imu", 0);
++	if (!st->wq)
++		return -ENOMEM;
++	ret = devm_add_action_or_reset(dev, ssc_imu_destroy_wq, st);
++	if (ret)
++		return ret;
++
++	indio_dev->name = "qcom-ssc-imu";
++	indio_dev->info = &ssc_imu_info;
++	indio_dev->channels = ssc_imu_channels;
++	indio_dev->num_channels = ARRAY_SIZE(ssc_imu_channels);
++	indio_dev->available_scan_masks = ssc_imu_scan_masks;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++
++	ret = devm_iio_kfifo_buffer_setup(dev, indio_dev, NULL);
++	if (ret)
++		return ret;
++
++	ret = qmi_handle_init(&st->qmi, SSC_IND_MAX + 256, &ssc_imu_qmi_ops,
++			      ssc_imu_qmi_handlers);
++	if (ret < 0)
++		return ret;
++	ret = devm_add_action_or_reset(dev, ssc_imu_qmi_teardown, st);
++	if (ret)
++		return ret;
++
++	ret = qmi_add_lookup(&st->qmi, SSC_QMI_SVC_ID, SSC_QMI_SVC_VERSION, 0);
++	if (ret < 0)
++		return ret;
++
++	return devm_iio_device_register(dev, indio_dev);
++}
++
++static const struct faux_device_ops ssc_imu_faux_ops = {
++	.probe = ssc_imu_probe,
++};
++
++static struct faux_device *ssc_imu_fdev;
++
++static int __init ssc_imu_init(void)
++{
++	ssc_imu_fdev = faux_device_create("qcom-ssc-imu", NULL,
++					  &ssc_imu_faux_ops);
++	if (!ssc_imu_fdev)
++		return -ENODEV;
++	return 0;
++}
++module_init(ssc_imu_init);
++
++static void __exit ssc_imu_exit(void)
++{
++	faux_device_destroy(ssc_imu_fdev);
++}
++module_exit(ssc_imu_exit);
++
++MODULE_DESCRIPTION("Qualcomm SSC IMU driver (sns_client over QRTR)");
++MODULE_LICENSE("GPL");
