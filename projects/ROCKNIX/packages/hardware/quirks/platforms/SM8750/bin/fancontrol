@@ -83,7 +83,27 @@ do
     fi
     INDEX=$(( $INDEX + 1 ))
   done
-  FSPEED=${SPEEDS[${INDEX}]}
+  # Piecewise-linear between curve points: ramp from this point's speed toward
+  # the next-hotter point instead of holding it until that threshold trips.
+  # A zero-speed point still means "fan off below here" (no ramp out of 0).
+  if (( INDEX == 0 ))
+  then
+    FSPEED=${SPEEDS[0]}
+  else
+    S_LO=${SPEEDS[${INDEX}]:-0}
+    T_LO=${TEMPS[${INDEX}]:-0}
+    S_HI=${SPEEDS[$(( INDEX - 1 ))]}
+    T_HI=${TEMPS[$(( INDEX - 1 ))]}
+    if (( S_LO == 0 ))
+    then
+      FSPEED=0
+    elif (( T_HI <= T_LO ))
+    then
+      FSPEED=${S_HI}
+    else
+      FSPEED=$(( S_LO + (S_HI - S_LO) * (CPU_TEMP - T_LO) / (T_HI - T_LO) ))
+    fi
+  fi
   if [ ! "${LASTSPEED}" = "${FSPEED}" ]
   then
     $DEBUG && log $0 "Setting PWM FAN to ${FSPEED} (${TEMP})" 2>/dev/null

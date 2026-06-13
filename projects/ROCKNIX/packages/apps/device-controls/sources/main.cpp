@@ -401,7 +401,7 @@ static std::string find_pwm()
 //
 // ROCKNIX runs /usr/bin/fancontrol (quirks/platforms/SM8750/bin/fancontrol)
 // as a systemd service: every 3s it averages the cpu/gpu thermal zones and
-// applies a step curve selected by the "cooling.profile" setting. The
+// applies an interpolated curve selected by the "cooling.profile" setting. The
 // "custom" profile sources /storage/.config/fancontrol.conf, so this tab
 // edits that file; boot persistence comes from the daemon, not this app.
 
@@ -538,15 +538,26 @@ static double fan_temp_now()
 
 static int fan_curve_eval(const FanCurve &c, double t)
 {
-    // mirror the daemon: first threshold strictly below the temp wins
-    for (int i = 0; i < 8; i++)
-        if (t > c.temp_c[i])
-            return c.speed[i];
+    // mirror the daemon: piecewise-linear between curve points, flat past the
+    // hottest point; a zero-speed point still means "off below here"
+    if (t > c.temp_c[0])
+        return c.speed[0];
+    for (int i = 1; i < 8; i++) {
+        if (t > c.temp_c[i]) {
+            int s_lo = c.speed[i], t_lo = c.temp_c[i];
+            int s_hi = c.speed[i - 1], t_hi = c.temp_c[i - 1];
+            if (s_lo == 0)
+                return 0;
+            if (t_hi <= t_lo)
+                return s_hi;
+            return (int)(s_lo + (s_hi - s_lo) * (t - t_lo) / (t_hi - t_lo));
+        }
+    }
     return c.speed[7];
 }
 
-// step-curve plot with touch/mouse-draggable control points; returns true
-// if the curve changed. sel = point highlighted / edited by the sliders.
+// interpolated-curve plot with touch/mouse-draggable control points; returns
+// true if the curve changed. sel = point highlighted / edited by the sliders.
 static bool fan_curve_plot(FanCurve &c, bool editable, int &sel,
                            double temp_now, int pwm_now)
 {
@@ -576,15 +587,26 @@ static bool fan_curve_plot(FanCurve &c, bool editable, int &sel,
         dl->AddText(ImVec2(p0.x + 2, Y(s) + 1), IM_COL32(160, 160, 170, 200), lab);
     }
 
-    // the curve, drawn exactly as the daemon evaluates it
+    // the curve, drawn exactly as the daemon evaluates it: linear segments
+    // between points; a zero-speed floor stays off up to the point above it
     ImU32 ccol = editable ? IM_COL32(120, 200, 255, 255) : IM_COL32(150, 150, 165, 255);
-    float prev_x = X(0);
-    float prev_y = Y(c.speed[7]);
-    for (int i = 6; i >= 0; i--) {
+    float prev_x, prev_y;
+    int first = 6;
+    if (c.speed[7] == 0) {
+        dl->AddLine(ImVec2(X(0), Y(0)), ImVec2(X(c.temp_c[6]), Y(0)), ccol, 2.0f);
+        dl->AddLine(ImVec2(X(c.temp_c[6]), Y(0)),
+                    ImVec2(X(c.temp_c[6]), Y(c.speed[6])), ccol, 2.0f);
+        prev_x = X(c.temp_c[6]);
+        prev_y = Y(c.speed[6]);
+        first = 5;
+    } else {
+        prev_x = X(0);
+        prev_y = Y(c.speed[7]);
+    }
+    for (int i = first; i >= 0; i--) {
         float x = X(c.temp_c[i]);
         float y = Y(c.speed[i]);
-        dl->AddLine(ImVec2(prev_x, prev_y), ImVec2(x, prev_y), ccol, 2.0f);
-        dl->AddLine(ImVec2(x, prev_y), ImVec2(x, y), ccol, 2.0f);
+        dl->AddLine(ImVec2(prev_x, prev_y), ImVec2(x, y), ccol, 2.0f);
         prev_x = x;
         prev_y = y;
     }
