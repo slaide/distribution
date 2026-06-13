@@ -1,0 +1,18 @@
+From: KONKR Pocket FIT Elite port
+Subject: [PATCH] arm64: dts: qcom: cq8725s: mark RX SoundWire port 9 as PCM
+
+Master port 9 carries the WCD939x HIFI_PCM headphone stream (384 kHz
+PCM); the controller needs its per-port PCM format enable set for it
+(soundwire qcom qcom,pcm-ports-mask). Inert unless the HPH PCM mode
+kcontrols are enabled.
+---
+--- a/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi
++++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi
+@@ -1036,6 +1036,7 @@
+ 
+ &swr1 {
+ 	status = "okay";
++	qcom,pcm-ports-mask = <0x200>;
+ 
+ 	wcd_rx: codec@0,4 {
+ 		compatible = "sdw20217010e00";

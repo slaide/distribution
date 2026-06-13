@@ -1,0 +1,42 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# 042-headphone-ucm-route — KONKR Pocket FIT Elite
+#
+# This device's ALSA UCM symlinks to the shared AYN/Odin3 HiFi.conf, which
+# defines the "Headphones" SectionDevice TWICE: first (correctly) as
+# PlaybackPCM "hw:${CardId},1" (the WCD939x HPH path), then again as
+# "hw:${CardId},0" (the Speaker/MI2S path).  ALSA keeps the LAST definition,
+# so PipeWire ends up routing the headphone jack out the speaker amps — the
+# jack detects and the stream "switches", but plays on the speakers.
+#
+# Drop the bogus second block by bind-mounting a corrected copy of HiFi.conf
+# over the read-only SYSTEM file, then restart wireplumber so it re-reads the
+# UCM.  Pairs with the kernel USBSS 3-pole routing (wcd939x-usbss.c) and the
+# MBHC bus-keepalive quirk (040-headphone-mbhc-wake).
+#
+# A proper fix would ship a KONKR-specific UCM in SYSTEM instead of
+# symlinking the Odin3 one.
+
+H=/usr/share/alsa/ucm2/AYN/Odin3/HiFi.conf
+FIX=/storage/.config/ucm-konkr/HiFi.conf
+
+[ -e "$H" ] || exit 0
+mkdir -p "$(dirname "$FIX")"
+
+# Keep everything up to (not including) the SECOND SectionDevice."Headphones".
+L=$(grep -n 'SectionDevice\."Headphones"' "$H" | sed -n 2p | cut -d: -f1)
+if [ -n "$L" ] && [ "$L" -gt 1 ]; then
+    head -n "$((L - 1))" "$H" > "$FIX"
+else
+    cp "$H" "$FIX"
+fi
+
+# Bind-mount the corrected file over the read-only SYSTEM copy (idempotent).
+# NB: mountpoint(1) only detects directory mounts, not file bind-mounts, so
+# check /proc/mounts directly to avoid stacking a second bind-mount on re-run.
+grep -q " $H " /proc/mounts || mount --bind "$FIX" "$H"
+
+# Force wireplumber to re-read the UCM with the duplicate removed.
+systemctl restart wireplumber 2>/dev/null || pkill -f wireplumber 2>/dev/null || true

@@ -1,0 +1,42 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# 045-headphone-pcm-mode — KONKR Pocket FIT Elite
+#
+# Switch the WCD9395 headphone path to HiFi PCM mode, matching stock
+# Android.  In the default (PDM) mode the codec's legacy PDM receive path
+# generates a constant hiss on the 3.5 mm jack; in PCM mode the stream
+# rides SoundWire port 9 as 384 kHz PCM and the codec runs its own
+# interpolator/compander, which is silent.  Kernel side: device patches
+# 0072 (lpass-rx-macro), 0073 (wcd939x), 0074 (soundwire qcom PCM port
+# format enable).
+#
+# Order matters: the HPH/COMP switches connect SoundWire ports at set
+# time, so they must be off while the PCM mode flags flip, then
+# reconnected (now routed to the HIFI_PCM port).
+
+# SoundWire RX master: port 9 carries PCM. Redundant with the
+# qcom,pcm-ports-mask DT property (patch 0075); kept for kernels whose
+# DTB predates it.
+P=/sys/module/soundwire_qcom/parameters/pcm_ports_mask
+[ -w "$P" ] && echo 0x200 > "$P"
+
+# wait for the sound card
+for _ in $(seq 1 60); do
+    amixer -c0 info >/dev/null 2>&1 && break
+    sleep 0.5
+done
+
+cset() { amixer -c0 cset name="$1" "$2" >/dev/null 2>&1; }
+
+cset "HPHL Switch" 0
+cset "HPHR Switch" 0
+cset "HPHL_COMP Switch" 0
+cset "HPHR_COMP Switch" 0
+cset "HPH PCM Switch" 1
+cset "RX_HPH PCM Switch" 1
+cset "HPHL_COMP Switch" 1
+cset "HPHR_COMP Switch" 1
+cset "HPHL Switch" 1
+cset "HPHR Switch" 1
