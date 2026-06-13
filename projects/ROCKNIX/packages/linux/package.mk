@@ -256,6 +256,15 @@ pre_make_target() {
     mkdir -p ${PKG_BUILD}/external-firmware/qcom/sm8750
       cp -Lv $(get_build_dir kernel-firmware)/.copied-firmware/qcom/sm8750/gen80000_zap.mbn ${PKG_BUILD}/external-firmware/qcom/sm8750
 
+    # KONKR Pocket FIT Elite: per-OEM-signed zap, distinct from the AYN one above.
+    # Must be built-in: the GPU loads its zap via request_firmware_direct during
+    # kernel init, before the rootfs /lib/firmware overlay is mounted, so a
+    # filesystem-only copy fails with -ENOENT (gpu hw init failed: -2). Its DT
+    # firmware-name selects this device-namespaced path, so no collision with the
+    # AYN/Odin3 zap that other SM8750 boards in the same image use.
+    mkdir -p ${PKG_BUILD}/external-firmware/qcom/sm8750/konkr/pfe
+      cp -Lv ${PROJECT_DIR}/${PROJECT}/devices/${DEVICE}/filesystem/usr/lib/kernel-overlays/base/lib/firmware/qcom/sm8750/konkr/pfe/gen80000_zap.mbn ${PKG_BUILD}/external-firmware/qcom/sm8750/konkr/pfe
+
     FW_LIST="$(find ${PKG_BUILD}/external-firmware -type f | sed 's|.*external-firmware/||' | sort | xargs)"
 
     ${PKG_BUILD}/scripts/config --set-str CONFIG_EXTRA_FIRMWARE "${FW_LIST}"
