@@ -1,0 +1,23 @@
+arm64: dts: qcom: KONKR add MCU serdev child node
+
+Child node under the 894000 MCU UART for the konkr_sysbtn serdev driver
+(system buttons + stick RGB). serdev consumes the port: this SE no longer
+enumerates as /dev/ttyHS*.
+
+---
+diff --git a/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts b/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts
+--- a/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts
++++ b/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts
+@@ -858,6 +858,12 @@
+ 		pinctrl-0 = <&qup_uart_mcu_default>;
+ 		pinctrl-names = "default";
+ 		status = "okay";
++
++		/* serdev client: konkr_sysbtn binds here, consumes the tty
++		 * (no /dev/ttyHS* for this SE once it does). */
++		mcu {
++			compatible = "konkr,pf-elite-mcu";
++		};
+ 	};
+ };
+ 
