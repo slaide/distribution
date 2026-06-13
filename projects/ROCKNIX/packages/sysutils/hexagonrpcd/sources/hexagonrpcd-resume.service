@@ -1,0 +1,13 @@
+[Unit]
+Description=Restart the sensor-PD FastRPC daemon after resume
+# hexagonrpcd-sensorspd stops on suspend (Conflicts=suspend.target);
+# nothing else restarts it, so the gyro/accel would stay dead after the
+# first suspend without this.
+After=suspend.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --no-block start hexagonrpcd-sensorspd.service
+
+[Install]
+WantedBy=suspend.target
