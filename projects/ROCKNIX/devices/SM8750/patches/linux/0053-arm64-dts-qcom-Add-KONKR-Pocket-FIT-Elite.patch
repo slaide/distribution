@@ -16,10 +16,10 @@ index b05e8ad..a8b495a 100644
  x1e001de-devkit-el2-dtbs	:= x1e001de-devkit.dtb x1-el2.dtbo
 diff --git a/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts b/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts
 new file mode 100644
-index 0000000..ad02e6605
+index 0000000..f32d52dcf
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts
-@@ -0,0 +1,1616 @@
+@@ -0,0 +1,1635 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * KONKR Pocket FIT Elite (Snapdragon 8 Elite / SM8750) — ROCKNIX board DTS
@@ -1029,10 +1029,29 @@ index 0000000..ad02e6605
 + * ===================================================================== */
 +&ufs_mem_hc {
 +	status = "okay";
++
++	/* Supplies transcribed from the konkr stock fdt (matched by rail
++	 * voltage to the mainline PMIC labels): vcc = pm_humu_l17 (2.504V),
++	 * vccq = pm_v8d_l1 (1.2V). vdd-hba is the GCC_UFS_PHY_GDSC power-domain
++	 * already wired in sm8750.dtsi. Without these the ufs-qcom probe fails
++	 * its mandatory regulator_get() and the device never enumerates. */
++	vcc-supply = <&vreg_l17b_2p5>;
++	vcc-max-microamp = <1300000>;
++	vccq-supply = <&vreg_l1d_1p2>;
++	vccq-max-microamp = <1200000>;
++
++	/* UFS device reset (active-low) on the dedicated tlmm "ufs_reset" pad
++	 * (offset 215, the pin after the GPIO range). Without it the eUFS is
++	 * held in POR reset -> DME_LINKSTARTUP times out (link startup -110). */
++	reset-gpios = <&tlmm 215 GPIO_ACTIVE_LOW>;
 +};
 +
 +&ufs_mem_phy {
 +	status = "okay";
++
++	/* vdda-phy = pm_v6j_l1 (0.88V), vdda-pll = pm_v8g_l3 (1.2V). */
++	vdda-phy-supply = <&vreg_l1j_0p91>;
++	vdda-pll-supply = <&vreg_l3g_1p2>;
 +};
 +
 +/* ===================================================================== *
