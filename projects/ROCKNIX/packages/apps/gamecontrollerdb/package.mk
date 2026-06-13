@@ -16,4 +16,10 @@ makeinstall_target() {
     cat ${PKG_DIR}/config/gamecontrollerdb.txt >${INSTALL}/usr/config/SDL-GameControllerDB/gamecontrollerdb.txt
   fi
   cat ${PKG_BUILD}/gamecontrollerdb.txt >>${INSTALL}/usr/config/SDL-GameControllerDB/gamecontrollerdb.txt
+
+  # InputPlumber's virtual "Microsoft Xbox 360" pad (xb360 target, GUID
+  # version 0100): SDL's BUILT-IN entry for it has the dpad hat bits inverted
+  # (authored against an old InputPlumber) and lacks guide/paddles. File
+  # entries replace built-ins, so appending the corrected mapping last wins.
+  echo '030081b85e0400008e02000001000000,Microsoft Xbox 360,a:b0,b:b1,x:b2,y:b3,back:b6,guide:b8,start:b7,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftshoulder:b4,rightshoulder:b5,leftstick:b9,rightstick:b10,lefttrigger:a2,righttrigger:a5,leftx:a0,lefty:a1,rightx:a3,righty:a4,paddle1:b11,paddle2:b12,paddle3:b13,paddle4:b14,platform:Linux,' >>${INSTALL}/usr/config/SDL-GameControllerDB/gamecontrollerdb.txt
 }
