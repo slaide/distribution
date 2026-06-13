@@ -77,6 +77,7 @@ modules() {
 quirks() {
   for QUIRK in /usr/lib/autostart/quirks/platforms/"${HW_DEVICE}"/sleep.d/${1}/* \
                /usr/lib/autostart/quirks/devices/"${QUIRK_DEVICE}"/sleep.d/${1}/*; do
+    [ -e "${QUIRK}" ] || continue
     "${QUIRK}" >${EVENTLOG} 2>&1
   done
 }
@@ -94,6 +95,16 @@ case $1 in
     powerstate stop
     modules stop
     quirks pre
+
+    # KONKR Pocket FIT Elite: hold a power-key inhibitor across the sleep. On
+    # its PMIC pwrkey the button press that wakes the device is delivered to
+    # logind after resume, which would immediately suspend again. nanosleep
+    # pauses while suspended, so this expires ~4s of awake time after resume.
+    if [ "${QUIRK_DEVICE}" = "KONKR Pocket FIT Elite" ]; then
+      nohup systemd-inhibit --what=handle-power-key --who=rocknix-sleep \
+        --why="post-resume power-key holdoff" --mode=block sleep 4 >/dev/null 2>&1 &
+    fi
+
     touch /run/.last_sleep_time
     ;;
   post)

@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+
+. /etc/profile.d/001-functions
+
+# Real hardware suspend works on this device: both s2idle ("freeze") and PSCI
+# deep suspend ("mem") resume the display cleanly (verified 2026-06-10 across
+# repeated s2idle/deep/DPMS cycles at 60 Hz and 144 Hz, under sway and
+# gamescope). Default to "mem" like the SM8750 platform quirk. The "off" check
+# also migrates devices that still carry the forced fake-suspend setting from
+# older builds (the platform quirk uses the same pattern).
+MYSLEEPMODE=$(get_setting system.suspendmode)
+if [ -z "${MYSLEEPMODE}" ] || [ "${MYSLEEPMODE}" = "off" ]
+then
+  /usr/bin/suspendmode mem
+fi
+
+# Drop the "standby freeze" fallback states from the mem config: a wake press
+# during the (slow, ~8 s) suspend entry aborts the mem suspend with EBUSY, and
+# systemd-sleep would then walk the state list and put the device straight
+# back to sleep via s2idle -- eating the wake press. With mem alone, an
+# aborted suspend leaves the device awake.
+SLEEP_CONF=/storage/.config/sleep.conf.d/sleep.conf
+if grep -q "^SuspendState=mem " "${SLEEP_CONF}" 2>/dev/null; then
+  sed -i 's/^SuspendState=mem .*/SuspendState=mem/' "${SLEEP_CONF}"
+fi
+
+# Settings for anyone who manually selects fake-suspend (suspendmode off):
+#  - dpms=0: turn the display off via the backlight (bl_power, honored by the
+#    aw99706 driver since patch 0057) instead of a DRM DPMS disable. The
+#    pipeline keeps scanning the last frame, so resume restores the image
+#    instantly.
+#  - park_cores=0: core parking saves little here and used to interact badly
+#    with the DPU vblank IRQ on CPU hotplug.
+set_setting system.suspend.dpms 0
+set_setting system.suspend.park_cores 0
+
+# Only rewrite the config and restart logind when the content actually
+# changes: every restart counts against logind's start-rate limit, and the
+# platform quirk, this quirk and any /storage shim each doing an unconditional
+# restart in one boot trips the limit -- logind then stays dead for the whole
+# session and the power key does nothing.
+LOGIND_CONF=~/.config/logind.conf.d/login.conf
+LOGIND_WANT="[Login]
+HandlePowerKey=suspend
+HandleSuspendKey=suspend"
+if [ "$(cat "${LOGIND_CONF}" 2>/dev/null)" != "${LOGIND_WANT}" ]; then
+  mkdir -p "$(dirname "${LOGIND_CONF}")"
+  printf '%s\n' "${LOGIND_WANT}" >"${LOGIND_CONF}"
+  systemctl try-restart systemd-logind.service 2>/dev/null || true
+fi

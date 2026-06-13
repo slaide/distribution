@@ -9,10 +9,17 @@ then
   /usr/bin/suspendmode mem
 fi
 
-cat <<EOF >~/.config/logind.conf.d/login.conf
-[Login]
+# Only rewrite the config and restart logind when the content actually
+# changes: every restart counts against logind's start-rate limit, and the
+# platform quirk, the device quirk and any /storage shim each doing an
+# unconditional restart in one boot trips the limit -- logind then stays dead
+# for the whole session and the power key does nothing.
+LOGIND_CONF=~/.config/logind.conf.d/login.conf
+LOGIND_WANT="[Login]
 HandlePowerKey=suspend
-HandleSuspendKey=suspend
-EOF
-
-systemctl try-restart systemd-logind.service 2>/dev/null || true
+HandleSuspendKey=suspend"
+if [ "$(cat "${LOGIND_CONF}" 2>/dev/null)" != "${LOGIND_WANT}" ]; then
+  mkdir -p "$(dirname "${LOGIND_CONF}")"
+  printf '%s\n' "${LOGIND_WANT}" >"${LOGIND_CONF}"
+  systemctl try-restart systemd-logind.service 2>/dev/null || true
+fi
