@@ -1,0 +1,42 @@
+#!/bin/sh
+# Assemble the hexagonfs served root for the ADSP sensor PD.
+#
+# hexagonrpcd serves a single -R root containing sensors/{config,registry,
+# registry-state,sns_reg.conf}. config/ + sns_reg.conf are read-only vendor
+# files shipped under /lib/firmware (via extra-firmware). registry/ and
+# registry-state/ must be writable: the PD regenerates the registry from the
+# JSON configs at startup (the factory persist copy is NOT required), so we
+# only need empty writable dirs; we keep them on /storage so the ~1 min
+# regenerate happens once rather than every boot.
+#
+# Exits non-zero (failing the service) if the vendor config payload is
+# absent, which is the case until it is added to the extra-firmware repo.
+
+set -e
+
+SERVE_ROOT="/storage/.cache/hexagonfs"
+SENSORS="${SERVE_ROOT}/sensors"
+
+# Locate the shipped read-only vendor sensor config payload.
+CONFIG_SRC=""
+for d in /lib/firmware/qcom/*/sensors /lib/firmware/qcom/*/*/*/sensors; do
+	if [ -d "${d}/config" ] && [ -f "${d}/config/json.lst" ]; then
+		CONFIG_SRC="${d}"
+		break
+	fi
+done
+
+if [ -z "${CONFIG_SRC}" ]; then
+	echo "hexagonrpcd-setup: no vendor sensor config payload under /lib/firmware (needs extra-firmware sensors/config + sns_reg.conf)" >&2
+	exit 1
+fi
+
+mkdir -p "${SENSORS}/registry" "${SENSORS}/registry-state"
+
+# config/ and sns_reg.conf are read-only: point at the shipped copy.
+ln -sfn "${CONFIG_SRC}/config" "${SENSORS}/config"
+if [ -f "${CONFIG_SRC}/sns_reg.conf" ]; then
+	ln -sfn "${CONFIG_SRC}/sns_reg.conf" "${SENSORS}/sns_reg.conf"
+fi
+
+echo "hexagonrpcd-setup: serving ${SERVE_ROOT} (config <- ${CONFIG_SRC})"

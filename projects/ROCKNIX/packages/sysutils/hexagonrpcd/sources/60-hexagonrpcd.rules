@@ -1,0 +1,4 @@
+# Start the sensor-PD FastRPC daemon when the ADSP secure node appears.
+# The ADSP remoteproc comes up seconds into boot, well after multi-user
+# would have evaluated a WantedBy pull, so the service is device-triggered.
+ACTION=="add", SUBSYSTEM=="misc", KERNEL=="fastrpc-adsp-secure", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hexagonrpcd-sensorspd.service"

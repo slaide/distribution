@@ -1,0 +1,17 @@
+[Unit]
+Description=FastRPC reverse tunnel for the ADSP sensor PD (SSC sensors)
+# Started by udev (60-hexagonrpcd.rules) when /dev/fastrpc-adsp-secure
+# appears — the ADSP remoteproc boots seconds into userspace, after
+# multi-user.target has already been evaluated, so a WantedBy pull would
+# race the device node (and its ConditionPathExists is never re-checked).
+ConditionPathExists=/dev/fastrpc-adsp-secure
+After=local-fs.target
+Conflicts=suspend.target
+Before=suspend.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/hexagonrpcd-setup
+ExecStart=/usr/bin/hexagonrpcd -f /dev/fastrpc-adsp-secure -d adsp -s -R /storage/.cache/hexagonfs
+Restart=always
+RestartSec=3
