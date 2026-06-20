@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# systemd system-sleep hook. On resume, poke konkr-inputd to re-assert its
+# evdev grabs / re-acquire its sources: the KONKR UART serdev (system buttons)
+# and SPI pad can wedge or re-enumerate across suspend.
+#   $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+
+case "$1" in
+    post)
+        systemctl kill -s SIGUSR1 konkr-inputd.service 2>/dev/null || true
+        ;;
+esac

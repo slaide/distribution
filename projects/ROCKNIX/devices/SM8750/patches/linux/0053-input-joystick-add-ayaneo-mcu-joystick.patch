@@ -37,7 +37,7 @@ new file mode 100644
 index 0000000..f66adc811
 --- /dev/null
 +++ b/drivers/input/joystick/mcu_joystick.c
-@@ -0,0 +1,676 @@
+@@ -0,0 +1,711 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * AYANEO SPI MCU gamepad driver (KONKR Pocket FIT Elite / AYN AYANEO SM8750 family)
@@ -152,26 +152,58 @@ index 0000000..f66adc811
 +#define MCU_REINITS_BEFORE_DANCE 3	/* command re-sends before a full
 +					 * power cycle */
 +
-+/* key bitmap -> input event. Map measured per-button on hardware (not
-+ * derived from the stock disassembly, whose bit grouping turned out wrong). */
++/*
++ * This device deliberately exposes NO buttons or axes. It emits a raw EV_MSC
++ * stream (MSC_RAW, value = (control-id << 16) | (u16)(s16)value) so udev/SDL
++ * never classify it as a gamepad — the konkr-inputd userspace service grabs it
++ * and synthesizes the actual virtual gamepad. Control-id contract (shared with
++ * konkr-inputd); konkr_sysbtn uses 0x20.. for its five system buttons.
++ */
++#define MCU_ID_A	0x01
++#define MCU_ID_B	0x02
++#define MCU_ID_X	0x03
++#define MCU_ID_Y	0x04
++#define MCU_ID_L1	0x05
++#define MCU_ID_R1	0x06
++#define MCU_ID_SELECT	0x07
++#define MCU_ID_START	0x08
++#define MCU_ID_MODE	0x09	/* front-top-left extra */
++#define MCU_ID_THUMBL	0x0a
++#define MCU_ID_THUMBR	0x0b
++#define MCU_ID_LX	0x10
++#define MCU_ID_LY	0x11
++#define MCU_ID_RX	0x12
++#define MCU_ID_RY	0x13
++#define MCU_ID_LT	0x14
++#define MCU_ID_RT	0x15
++#define MCU_ID_HATX	0x16
++#define MCU_ID_HATY	0x17
++
++/* key bitmap -> control id. Map measured per-button on hardware (not derived
++ * from the stock disassembly, whose bit grouping turned out wrong). */
 +struct mcu_btn {
 +	u8 bit;
-+	u16 code;
++	u8 id;
 +};
 +
 +static const struct mcu_btn mcu_btn_map[] = {
-+	{ 0,  BTN_SOUTH },	/* 0x130, A */
-+	{ 1,  BTN_EAST },	/* 0x131, B */
-+	{ 2,  BTN_NORTH },	/* 0x133, X */
-+	{ 3,  BTN_WEST },	/* 0x134, Y */
-+	{ 8,  BTN_TL },		/* 0x136, L1 */
-+	{ 9,  BTN_TR },		/* 0x137, R1 */
-+	{ 10, BTN_THUMBL },	/* 0x13d, L3 */
-+	{ 11, BTN_THUMBR },	/* 0x13e, R3 */
-+	{ 12, BTN_START },	/* 0x13b */
-+	{ 13, BTN_SELECT },	/* 0x13a */
-+	{ 14, BTN_MODE },	/* 0x13c, "back" extra -> guide */
++	{ 0,  MCU_ID_A },	/* 0x130, A */
++	{ 1,  MCU_ID_B },	/* 0x131, B */
++	{ 2,  MCU_ID_X },	/* 0x133, X */
++	{ 3,  MCU_ID_Y },	/* 0x134, Y */
++	{ 8,  MCU_ID_L1 },	/* 0x136, L1 */
++	{ 9,  MCU_ID_R1 },	/* 0x137, R1 */
++	{ 10, MCU_ID_THUMBL },	/* 0x13d, L3 */
++	{ 11, MCU_ID_THUMBR },	/* 0x13e, R3 */
++	{ 12, MCU_ID_START },	/* 0x13b */
++	{ 13, MCU_ID_SELECT },	/* 0x13a */
++	{ 14, MCU_ID_MODE },	/* 0x13c, "back" extra */
 +};
++
++static void mcu_emit(struct input_dev *in, u8 id, s16 val)
++{
++	input_event(in, EV_MSC, MSC_RAW, ((u32)id << 16) | (u16)val);
++}
 +
 +/* dpad bits -> HAT axes (measured) */
 +#define MCU_DPAD_UP	BIT(4)
@@ -198,6 +230,7 @@ index 0000000..f66adc811
 +	unsigned int bad_frames;
 +	unsigned int reinit_fails;
 +	bool dead;
++	s16 prev[0x18];			/* last emitted value per control id (dedup) */
 +};
 +
 +/*
@@ -348,56 +381,64 @@ index 0000000..f66adc811
 +	msleep(600);
 +}
 +
++/* Emit only on change (EV_MSC is not deduped by the input core, unlike
++ * input_report_*). Flooding every control every frame oversizes the packet and
++ * desyncs edge-detecting consumers (e.g. Steam Input). Returns true if emitted. */
++static bool mcu_emit_changed(struct mcu_joystick *mcu, u8 id, s16 val)
++{
++	if (mcu->prev[id] == val)
++		return false;
++	mcu->prev[id] = val;
++	mcu_emit(mcu->input, id, val);
++	return true;
++}
++
 +static void mcu_report(struct mcu_joystick *mcu, const u16 regs[MCU_NREGS])
 +{
-+	struct input_dev *in = mcu->input;
 +	u16 key = regs[MCU_FRAME_KEY];
++	bool dirty = false;
 +	int i;
 +
 +	/* stock: X/RX as-is, Y/RY bitwise-inverted (mvn + sxth) */
-+	input_report_abs(in, ABS_X,  (s16)regs[MCU_FRAME_X]);
-+	input_report_abs(in, ABS_Y,  (s16)~regs[MCU_FRAME_Y]);
-+	input_report_abs(in, ABS_RX, (s16)regs[MCU_FRAME_Z]);
-+	input_report_abs(in, ABS_RY, (s16)~regs[MCU_FRAME_RZ]);
-+	/* trigger reg: low byte = left (ABS_Z), high byte = right (ABS_RZ);
-+	 * stock also reports digital TL2/TR2 at full deflection */
-+	input_report_abs(in, ABS_Z,  regs[MCU_FRAME_TRIG] & 0xff);
-+	input_report_abs(in, ABS_RZ, regs[MCU_FRAME_TRIG] >> 8);
-+	input_report_key(in, BTN_TL2, (regs[MCU_FRAME_TRIG] & 0xff) == 0xff);
-+	input_report_key(in, BTN_TR2, (regs[MCU_FRAME_TRIG] >> 8) == 0xff);
++	dirty |= mcu_emit_changed(mcu, MCU_ID_LX, (s16)regs[MCU_FRAME_X]);
++	dirty |= mcu_emit_changed(mcu, MCU_ID_LY, (s16)~regs[MCU_FRAME_Y]);
++	dirty |= mcu_emit_changed(mcu, MCU_ID_RX, (s16)regs[MCU_FRAME_Z]);
++	dirty |= mcu_emit_changed(mcu, MCU_ID_RY, (s16)~regs[MCU_FRAME_RZ]);
++	/* trigger reg: low byte = left, high byte = right (analog only — the
++	 * digital full-deflection buttons are intentionally not reported) */
++	dirty |= mcu_emit_changed(mcu, MCU_ID_LT, regs[MCU_FRAME_TRIG] & 0xff);
++	dirty |= mcu_emit_changed(mcu, MCU_ID_RT, regs[MCU_FRAME_TRIG] >> 8);
 +
 +	for (i = 0; i < ARRAY_SIZE(mcu_btn_map); i++)
-+		input_report_key(in, mcu_btn_map[i].code,
-+				 !!(key & BIT(mcu_btn_map[i].bit)));
++		dirty |= mcu_emit_changed(mcu, mcu_btn_map[i].id,
++					  !!(key & BIT(mcu_btn_map[i].bit)));
 +
-+	input_report_abs(in, ABS_HAT0X,
-+			 !!(key & MCU_DPAD_RIGHT) - !!(key & MCU_DPAD_LEFT));
-+	input_report_abs(in, ABS_HAT0Y,
-+			 !!(key & MCU_DPAD_DOWN) - !!(key & MCU_DPAD_UP));
++	dirty |= mcu_emit_changed(mcu, MCU_ID_HATX,
++				  !!(key & MCU_DPAD_RIGHT) - !!(key & MCU_DPAD_LEFT));
++	dirty |= mcu_emit_changed(mcu, MCU_ID_HATY,
++				  !!(key & MCU_DPAD_DOWN) - !!(key & MCU_DPAD_UP));
 +
-+	input_sync(in);
++	if (dirty)
++		input_sync(mcu->input);
 +}
 +
 +/* release everything — a wedged MCU otherwise leaves the last state (e.g. a
-+ * held dpad direction) latched in evdev forever */
++ * held dpad direction) latched forever */
 +static void mcu_report_idle(struct mcu_joystick *mcu)
 +{
-+	struct input_dev *in = mcu->input;
++	static const u8 axis_ids[] = {
++		MCU_ID_LX, MCU_ID_LY, MCU_ID_RX, MCU_ID_RY,
++		MCU_ID_LT, MCU_ID_RT, MCU_ID_HATX, MCU_ID_HATY,
++	};
++	bool dirty = false;
 +	int i;
 +
-+	input_report_abs(in, ABS_X, 0);
-+	input_report_abs(in, ABS_Y, 0);
-+	input_report_abs(in, ABS_RX, 0);
-+	input_report_abs(in, ABS_RY, 0);
-+	input_report_abs(in, ABS_Z, 0);
-+	input_report_abs(in, ABS_RZ, 0);
-+	input_report_abs(in, ABS_HAT0X, 0);
-+	input_report_abs(in, ABS_HAT0Y, 0);
-+	input_report_key(in, BTN_TL2, 0);
-+	input_report_key(in, BTN_TR2, 0);
++	for (i = 0; i < ARRAY_SIZE(axis_ids); i++)
++		dirty |= mcu_emit_changed(mcu, axis_ids[i], 0);
 +	for (i = 0; i < ARRAY_SIZE(mcu_btn_map); i++)
-+		input_report_key(in, mcu_btn_map[i].code, 0);
-+	input_sync(in);
++		dirty |= mcu_emit_changed(mcu, mcu_btn_map[i].id, 0);
++	if (dirty)
++		input_sync(mcu->input);
 +}
 +
 +/* returns true if the frame header validated */
@@ -496,7 +537,7 @@ index 0000000..f66adc811
 +	struct mcu_joystick *mcu;
 +	struct input_dev *in;
 +	u16 regs[MCU_NREGS];
-+	int i, ret;
++	int ret;
 +
 +	mcu = devm_kzalloc(dev, sizeof(*mcu), GFP_KERNEL);
 +	if (!mcu)
@@ -564,18 +605,12 @@ index 0000000..f66adc811
 +	in->id.bustype = BUS_SPI;
 +	in->dev.parent = dev;
 +
-+	input_set_abs_params(in, ABS_X,  MCU_AXIS_MIN, MCU_AXIS_MAX, MCU_AXIS_FUZZ, MCU_AXIS_FLAT);
-+	input_set_abs_params(in, ABS_Y,  MCU_AXIS_MIN, MCU_AXIS_MAX, MCU_AXIS_FUZZ, MCU_AXIS_FLAT);
-+	input_set_abs_params(in, ABS_RX, MCU_AXIS_MIN, MCU_AXIS_MAX, MCU_AXIS_FUZZ, MCU_AXIS_FLAT);
-+	input_set_abs_params(in, ABS_RY, MCU_AXIS_MIN, MCU_AXIS_MAX, MCU_AXIS_FUZZ, MCU_AXIS_FLAT);
-+	input_set_abs_params(in, ABS_Z,  0, MCU_TRIG_MAX, 0, 0);
-+	input_set_abs_params(in, ABS_RZ, 0, MCU_TRIG_MAX, 0, 0);
-+	input_set_abs_params(in, ABS_HAT0X, -1, 1, 0, 0);
-+	input_set_abs_params(in, ABS_HAT0Y, -1, 1, 0, 0);
-+	for (i = 0; i < ARRAY_SIZE(mcu_btn_map); i++)
-+		input_set_capability(in, EV_KEY, mcu_btn_map[i].code);
-+	input_set_capability(in, EV_KEY, BTN_TL2);
-+	input_set_capability(in, EV_KEY, BTN_TR2);
++	/* Raw MSC stream only — no buttons/axes, so nothing classifies this as a
++	 * gamepad. konkr-inputd decodes the control-ids into the real pad. */
++	input_set_capability(in, EV_MSC, MSC_RAW);
++	/* The packet-size estimate is keys/axes-based (=0 here); size it for a
++	 * worst-case full-state frame so MSC bursts never overflow the buffer. */
++	input_set_events_per_packet(in, 32);
 +
 +	/* rumble (FF_RUMBLE via the memless core; play deferred to ff_work) */
 +	INIT_WORK(&mcu->ff_work, mcu_ff_work);

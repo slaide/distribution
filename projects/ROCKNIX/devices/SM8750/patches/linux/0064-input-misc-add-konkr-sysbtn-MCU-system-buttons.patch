@@ -49,7 +49,7 @@ diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
 diff --git a/drivers/input/misc/konkr_sysbtn.c b/drivers/input/misc/konkr_sysbtn.c
 --- /dev/null
 +++ b/drivers/input/misc/konkr_sysbtn.c
-@@ -0,0 +1,498 @@
+@@ -0,0 +1,497 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * konkr_sysbtn - KONKR Pocket FIT Elite MCU UART client: the five "system"
@@ -210,9 +210,10 @@ diff --git a/drivers/input/misc/konkr_sysbtn.c b/drivers/input/misc/konkr_sysbtn
 +		if (j < 8)
 +			continue;
 +
-+		input_report_key(kb->input,
-+				 BTN_TRIGGER_HAPPY1 + (run[0] >> 4) - 1,
-+				 run[0] & 0x1);
++		/* Raw EV_MSC stream (control id 0x20 + button index 0..4), so this
++		 * is not classified as an input device; konkr-inputd maps it. */
++		input_event(kb->input, EV_MSC, MSC_RAW,
++			    ((u32)(0x20 + (run[0] >> 4) - 1) << 16) | (run[0] & 0x1));
 +		input_sync(kb->input);
 +		kb->rxlen = 0;
 +	}
@@ -484,9 +485,7 @@ diff --git a/drivers/input/misc/konkr_sysbtn.c b/drivers/input/misc/konkr_sysbtn
 +	kb->input->id.vendor = 0xa7a0;
 +	kb->input->id.product = 0x0001;
 +	kb->input->id.version = 0x0001;
-+	for (i = 0; i < KONKR_NBTN; i++)
-+		input_set_capability(kb->input, EV_KEY,
-+				     BTN_TRIGGER_HAPPY1 + i);
++	input_set_capability(kb->input, EV_MSC, MSC_RAW);
 +
 +	error = input_register_device(kb->input);
 +	if (error)

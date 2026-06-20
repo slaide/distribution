@@ -1,0 +1,21 @@
+[Unit]
+Description=KONKR input authority (grab physical pads + emit virtual xb360)
+# NOTE: do NOT pull in systemd-udev-settle here — it can hit its 120s timeout on
+# this SoC (a device that never settles) and stall every boot. Default ordering
+# (after sysinit/udev coldplug) plus the daemon's own retry loop is enough.
+After=systemd-udevd.service
+# Own the physical evdevs before anything enumerates input, or consumers briefly
+# see the raw pads (double input). Capped TimeoutStartSec so a missed READY can
+# never hang boot for long.
+Before=emulationstation.service sway.service essway.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=15
+ExecStart=/usr/bin/konkr-inputd
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
