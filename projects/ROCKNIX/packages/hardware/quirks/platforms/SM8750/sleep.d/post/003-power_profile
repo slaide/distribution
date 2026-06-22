@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
+
+### Re-apply the CPU/GPU power-profile cap after resume, in case the freq
+### policy limits were reset across suspend.
+
+. /etc/profile
+
+PROFILE=$(get_setting system.powerprofile)
+[ -n "${PROFILE}" ] || PROFILE="full"
+
+/usr/lib/autostart/quirks/platforms/SM8750/bin/power_profile "${PROFILE}"

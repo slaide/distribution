@@ -2,7 +2,25 @@
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
 
+# SM8750 has two cpufreq policies: policy0 (cores 0-5) and policy6 (prime 6-7).
 cat <<EOF >/storage/.config/profile.d/010-governors
-CPU_FREQ=("/sys/devices/system/cpu/cpufreq/policy0" "/sys/devices/system/cpu/cpufreq/policy2" "/sys/devices/system/cpu/cpufreq/policy5" "/sys/devices/system/cpu/cpufreq/policy7")
+CPU_FREQ=("/sys/devices/system/cpu/cpufreq/policy0" "/sys/devices/system/cpu/cpufreq/policy6")
 GPU_FREQ=("/sys/devices/platform/soc@0/3d00000.gpu/devfreq/3d00000.gpu")
 EOF
+
+# Boost OPPs (prime cluster 4.2/4.32 GHz) are gated off by default; enable them
+# so the limits firmware may grant boost clocks when thermals allow. Early
+# writes don't stick (policies register over the first seconds of boot and a
+# late-registering policy comes up boost-off again), and a plain backgrounded
+# loop dies with the autostart cgroup (Type=oneshot kills leftovers) — so
+# detach via systemd-run and blanket-rewrite for 30 s instead of trying to
+# detect readiness. Re-raising scaling_max after 016-power_profile is fine:
+# the kernel refreshes policy limits when boost turns on.
+systemd-run --quiet --collect --unit=sm8750-cpufreq-boost /bin/sh -c '
+  for _ in $(seq 1 30); do
+    echo 1 >/sys/devices/system/cpu/cpufreq/boost 2>/dev/null
+    for BOOST in /sys/devices/system/cpu/cpufreq/policy*/boost; do
+      echo 1 >"${BOOST}" 2>/dev/null
+    done
+    sleep 1
+  done'

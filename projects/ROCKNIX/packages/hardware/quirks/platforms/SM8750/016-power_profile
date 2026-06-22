@@ -1,0 +1,14 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
+
+# Re-apply the saved CPU/GPU power-profile cap. scaling_max_freq / devfreq
+# max_freq reset to the hardware ceiling on every boot, so the cap has to be
+# restored here. Runs after 010-governors has written the freq-path vars.
+
+. /etc/profile
+
+PROFILE=$(get_setting system.powerprofile)
+[ -n "${PROFILE}" ] || PROFILE="full"
+
+/usr/lib/autostart/quirks/platforms/SM8750/bin/power_profile "${PROFILE}"

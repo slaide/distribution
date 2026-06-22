@@ -1,0 +1,92 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
+
+# Android-style power profiles: cap the max CPU/GPU frequency. Governors are
+# left untouched, so whatever scaling policy is active (incl. the "performance"
+# gov runemu forces) simply never exceeds the cap. Same lever Android pulls.
+#
+# usage: power_profile <full|balanced|saver>      named presets (per-cluster %)
+#        power_profile custom <cpu_khz> <gpu_hz>   absolute caps from the UI
+#
+# Named presets scale every node by a percentage of its own ceiling. "custom"
+# takes an absolute CPU cap (kHz, applied to every cluster, clamped to each
+# cluster's range) and GPU cap (Hz, snapped to the nearest OPP <=), so the UI
+# can step the sliders over real, valid frequencies. Custom caps are persisted
+# and re-applied at boot/resume.
+
+. /etc/profile.d/001-functions
+
+if [ -z "${GPU_FREQ}" ]; then
+  . /etc/profile
+fi
+
+PROFILE="${1:-full}"
+
+# highest GPU OPP (Hz)
+gpu_top() {
+  top=0
+  for f in $(cat "${GPU_FREQ}/available_frequencies" 2>/dev/null); do
+    [ "${f}" -gt "${top}" ] && top=${f}
+  done
+  echo "${top}"
+}
+
+# cap every CPU policy to pct% of its OWN ceiling (per-cluster ratio)
+apply_cpu_pct() {
+  pct="$1"
+  for POLICY in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -e "${POLICY}/cpuinfo_max_freq" ] || continue
+    hwmax=$(cat "${POLICY}/cpuinfo_max_freq")
+    hwmin=$(cat "${POLICY}/cpuinfo_min_freq" 2>/dev/null || echo 0)
+    t=$(( hwmax * pct / 100 ))
+    [ "${t}" -lt "${hwmin}" ] && t=${hwmin}
+    echo "${t}" > "${POLICY}/scaling_max_freq" 2>/dev/null
+  done
+}
+
+# cap every CPU policy to an absolute kHz, clamped to each cluster's range
+apply_cpu_khz() {
+  want="$1"
+  case "${want}" in (*[!0-9]*|"") want=99999999 ;; esac   # empty -> uncapped
+  for POLICY in /sys/devices/system/cpu/cpufreq/policy*; do
+    [ -e "${POLICY}/cpuinfo_max_freq" ] || continue
+    hwmax=$(cat "${POLICY}/cpuinfo_max_freq")
+    hwmin=$(cat "${POLICY}/cpuinfo_min_freq" 2>/dev/null || echo 0)
+    t="${want}"
+    [ "${t}" -gt "${hwmax}" ] && t=${hwmax}
+    [ "${t}" -lt "${hwmin}" ] && t=${hwmin}
+    echo "${t}" > "${POLICY}/scaling_max_freq" 2>/dev/null
+  done
+}
+
+# cap GPU max_freq to the highest OPP <= the requested Hz
+apply_gpu_hz() {
+  want="$1"
+  [ -e "${GPU_FREQ}/available_frequencies" ] || return
+  case "${want}" in (*[!0-9]*|"") want=$(gpu_top) ;; esac   # empty -> uncapped
+  pick=0; lo=0
+  for f in $(cat "${GPU_FREQ}/available_frequencies"); do
+    { [ "${lo}" -eq 0 ] || [ "${f}" -lt "${lo}" ]; } && lo=${f}
+    [ "${want}" -ge "${f}" ] && [ "${f}" -gt "${pick}" ] && pick=${f}
+  done
+  [ "${pick}" -eq 0 ] && pick=${lo}
+  echo "${pick}" > "${GPU_FREQ}/max_freq" 2>/dev/null
+}
+
+case "${PROFILE}" in
+  full)     apply_cpu_pct 100; apply_gpu_hz "$(gpu_top)" ;;
+  balanced) apply_cpu_pct 75;  apply_gpu_hz "$(( $(gpu_top) * 75 / 100 ))" ;;
+  saver)    apply_cpu_pct 50;  apply_gpu_hz "$(( $(gpu_top) * 50 / 100 ))" ;;
+  custom)
+    CPU_KHZ="${2:-$(get_setting system.powerprofile.cpukhz)}"
+    GPU_HZ="${3:-$(get_setting system.powerprofile.gpuhz)}"
+    apply_cpu_khz "${CPU_KHZ}"
+    apply_gpu_hz "${GPU_HZ}"
+    set_setting system.powerprofile.cpukhz "${CPU_KHZ}"
+    set_setting system.powerprofile.gpuhz "${GPU_HZ}"
+    ;;
+  *)        echo "power_profile: unknown profile '${PROFILE}'" >&2; exit 1 ;;
+esac
+
+set_setting system.powerprofile "${PROFILE}"
