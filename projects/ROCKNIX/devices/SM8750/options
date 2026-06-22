@@ -53,7 +53,7 @@
     FIRMWARE=""
 
   # Additional packages to install
-    ADDITIONAL_PACKAGES="gamepadcalibration rocknix-abl konkr-inputd extra-firmware device-controls hexagonrpcd"
+    ADDITIONAL_PACKAGES="gamepadcalibration rocknix-abl konkr-inputd extra-firmware device-controls konkr-launcher hexagonrpcd"
 
   # Debug tty path
     DEBUG_TTY="/dev/ttyMSM0"

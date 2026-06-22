@@ -2,7 +2,21 @@
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
 
-### Set the default device configuration
-cat <<EOF >/storage/.config/profile.d/090-ui_service
-UI_SERVICE="sway.service essway.service"
+### Select the boot frontend from the persisted system.frontend setting.
+### The generated snippet resolves it at profile-source time (get_setting is
+### defined by 001-functions, sourced before this 090- file), and autostart
+### re-sources the profile just before `systemctl start ${UI_SERVICE}`.
+###
+###   es              EmulationStation           (default / unset)
+###   steam           Steam Big Picture session  (drops back to ES on exit)
+###   konkr-launcher  konkr-launcher grid frontend
+###
+### sway.service stays in every set: the Steam path reads its display geometry
+### from the live sway (swaymsg) before handing the display to gamescope.
+cat <<'EOF' >/storage/.config/profile.d/090-ui_service
+case "$(get_setting system.frontend)" in
+  steam)          UI_SERVICE="sway.service steam-session.service" ;;
+  konkr-launcher) UI_SERVICE="sway.service konkr-launcher.service" ;;
+  *)              UI_SERVICE="sway.service essway.service" ;;
+esac
 EOF

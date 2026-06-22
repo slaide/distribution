@@ -1,0 +1,17 @@
+[Unit]
+Description=Steam Big Picture session (boot frontend)
+# No Requires=sway: the Steam launcher stops sway itself once it has read the
+# display geometry, so we must not be torn down with it. After= only orders us
+# behind sway's startup (autostart starts both in one `systemctl start`).
+After=sway.service
+
+[Service]
+Type=simple
+Environment=HOME=/storage
+Environment=XDG_RUNTIME_DIR=/var/run/0-runtime-dir
+EnvironmentFile=/etc/profile
+ExecStart=/usr/bin/start_steam_session.sh
+WorkingDirectory=/storage
+# Steam's launcher starts essway (EmulationStation) on exit; don't relaunch
+# Steam over it.
+Restart=no
