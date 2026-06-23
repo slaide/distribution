@@ -765,7 +765,7 @@ static const char *apply_opener(char *args)
 static void load_defaults(void)
 {
     opener_si = SI_KONKR;
-    opener_hold = true;
+    opener_hold = true;    // KONKR long-press opens the settings overlay
     for (int i = 0; i < SI_COUNT; i++)
         bindings[i] = (struct binding){ .press = { .type = ACT_NONE } };
     bindings[SI_FRONT_TL].press = (struct action){ .type = ACT_KEY, .code = KEY_F11 };

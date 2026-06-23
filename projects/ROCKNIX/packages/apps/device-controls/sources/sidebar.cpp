@@ -79,6 +79,12 @@ static void daemon_send(const char *s)
         (void)!send(g_sock, s, strlen(s), MSG_NOSIGNAL);
 }
 
+// Opening the overlay puts the daemon in intercept mode so gamepad nav is
+// diverted to us (the session underneath stops receiving it); closing restores
+// normal input routing.
+static void overlay_enter() { daemon_send("INTERCEPT 1"); }
+static void overlay_leave() { daemon_send("INTERCEPT 0"); }
+
 // --------------------------------------------------------------- wayland
 
 static wl_display *g_dpy;
@@ -188,6 +194,23 @@ static void ls_configure(void *, zwlr_layer_surface_v1 *s, uint32_t serial, uint
 static void ls_closed(void *, zwlr_layer_surface_v1 *) { g_quit = true; }
 static const zwlr_layer_surface_v1_listener ls_listener = { ls_configure, ls_closed };
 
+// ---- frame callback: gate rendering on compositor readiness ----
+//
+// eglSwapBuffers on the Wayland/Mesa backend blocks in the wl event queue
+// waiting for a buffer release when the pool is busy. With no explicit frame
+// pacing the second swap wedged the whole loop in a single-fd wl poll — which
+// still woke for touch (wl fd) but never serviced the daemon socket, so gamepad
+// nav was dead. We only render+swap once the compositor has presented the
+// previous frame (frame callback fired), so the swap never blocks and the input
+// loop keeps polling both fds.
+static bool g_frame_ready = true;
+static void frame_done(void *, wl_callback *cb, uint32_t)
+{
+    wl_callback_destroy(cb);
+    g_frame_ready = true;
+}
+static const wl_callback_listener frame_listener = { frame_done };
+
 // ----------------------------------------------------- daemon nav events
 
 static void read_daemon_events()
@@ -271,7 +294,8 @@ static void set_brightness_pct(int pct)
 }
 static int get_volume_pct()
 {
-    FILE *p = popen("wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
+    // timeout: never let a stuck wpctl block the render thread indefinitely.
+    FILE *p = popen("timeout 1 wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null", "r");
     if (!p)
         return -1;
     char buf[64] = {};
@@ -286,8 +310,10 @@ static int get_volume_pct()
 }
 static void set_volume_pct(int pct)
 {
+    // Fire-and-forget: a slider drag fires many of these; don't block the
+    // render thread waiting for each wpctl to finish.
     char cmd[96];
-    snprintf(cmd, sizeof cmd, "wpctl set-volume @DEFAULT_AUDIO_SINK@ %d%%", pct);
+    snprintf(cmd, sizeof cmd, "wpctl set-volume @DEFAULT_AUDIO_SINK@ %d%% >/dev/null 2>&1 &", pct);
     sb_run(cmd);
 }
 
@@ -444,6 +470,10 @@ static int run_sidebar_wayland()
         fprintf(stderr, "sidebar: EGL/surface setup failed\n");
         return 1;
     }
+    // Don't throttle on vsync (a frame callback may never arrive if the overlay
+    // is occluded -> eglSwapBuffers would block forever). The wall-clock frame
+    // gate in the loop below caps the rate instead.
+    eglSwapInterval(g_egl_dpy, 0);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -458,32 +488,66 @@ static int run_sidebar_wayland()
 
     resolve_backlight();
     daemon_connect();
-    daemon_send("INTERCEPT 1");
+    overlay_enter();
 
     int wl_fd = wl_display_get_fd(g_dpy);
-    struct timespec last;
+    const long frame_ns = 16666667;   // ~60 fps cap
+    struct timespec last, last_swap;
     clock_gettime(CLOCK_MONOTONIC, &last);
+    last_swap = last;
 
     while (!g_quit) {
         wl_display_dispatch_pending(g_dpy);
         wl_display_flush(g_dpy);
 
+        // Sleep in poll until input arrives or the next frame is due — so an
+        // idle overlay waits instead of busy-looping. While waiting for the
+        // compositor's frame callback (render gated below) poll on a coarse
+        // tick rather than spinning at timeout 0.
+        struct timespec n0;
+        clock_gettime(CLOCK_MONOTONIC, &n0);
+        long since = (n0.tv_sec - last.tv_sec) * 1000000000L + (n0.tv_nsec - last.tv_nsec);
+        int timeout_ms;
+        if (!g_frame_ready)
+            timeout_ms = 100;                 // awaiting frame callback / input
+        else
+            timeout_ms = since >= frame_ns ? 0 : (int)((frame_ns - since) / 1000000L) + 1;
+
         struct pollfd pfds[2] = {
             { wl_fd, POLLIN, 0 },
             { g_sock, (short)(g_sock >= 0 ? POLLIN : 0), 0 },
         };
-        poll(pfds, 2, 16);
+        poll(pfds, 2, timeout_ms);
         if (pfds[0].revents & POLLIN)
             wl_display_dispatch(g_dpy);
-        if (g_sock >= 0 && (pfds[1].revents & POLLIN))
+        if (g_sock >= 0 && (pfds[1].revents & (POLLHUP | POLLERR))) {
+            close(g_sock);                 // daemon gone: stop polling a dead fd
+            g_sock = -1;
+        } else if (g_sock >= 0 && (pfds[1].revents & POLLIN)) {
             read_daemon_events();
+        }
 
+        // Render only when the compositor has presented the previous frame
+        // (frame callback fired) and the frame interval has elapsed. Gating on
+        // the callback keeps eglSwapBuffers from blocking on a busy buffer pool
+        // — that block wedged the loop in a wl-only poll and starved the daemon
+        // socket (gamepad nav). Watchdog: if a callback is somehow lost, render
+        // anyway after 500ms so the overlay can never freeze permanently.
         struct timespec nowt;
         clock_gettime(CLOCK_MONOTONIC, &nowt);
-        float dt = (nowt.tv_sec - last.tv_sec) + (nowt.tv_nsec - last.tv_nsec) / 1e9f;
+        long elapsed = (nowt.tv_sec - last.tv_sec) * 1000000000L + (nowt.tv_nsec - last.tv_nsec);
+        if (!g_frame_ready) {
+            long stalled = (nowt.tv_sec - last_swap.tv_sec) * 1000000000L +
+                           (nowt.tv_nsec - last_swap.tv_nsec);
+            if (stalled < 500000000L)
+                continue;
+            g_frame_ready = true;
+        }
+        if (elapsed < frame_ns)
+            continue;
         last = nowt;
         io.DisplaySize = ImVec2((float)g_w, (float)g_h);
-        io.DeltaTime = dt > 0 ? dt : 1.0f / 60.0f;
+        io.DeltaTime = elapsed / 1e9f;
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui::NewFrame();
@@ -494,10 +558,17 @@ static int run_sidebar_wayland()
         glClearColor(0, 0, 0, 0);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // Arm the frame callback before the commit that eglSwapBuffers issues,
+        // then mark the pool busy until the compositor presents this frame.
+        g_frame_ready = false;
+        wl_callback *fcb = wl_surface_frame(g_surf);
+        wl_callback_add_listener(fcb, &frame_listener, nullptr);
         eglSwapBuffers(g_egl_dpy, g_egl_surf);
+        clock_gettime(CLOCK_MONOTONIC, &last_swap);
     }
 
-    daemon_send("INTERCEPT 0");
+    overlay_leave();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui::DestroyContext();
     if (g_sock >= 0)
@@ -577,7 +648,7 @@ static int run_sidebar_x11()
 
     resolve_backlight();
     daemon_connect();
-    daemon_send("INTERCEPT 1");
+    overlay_enter();
 
     while (!g_quit) {
         SDL_Event ev;
@@ -607,7 +678,7 @@ static int run_sidebar_x11()
         SDL_Delay(16);
     }
 
-    daemon_send("INTERCEPT 0");
+    overlay_leave();
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
