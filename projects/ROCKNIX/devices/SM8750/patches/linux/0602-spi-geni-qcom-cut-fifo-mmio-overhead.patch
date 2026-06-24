@@ -1,0 +1,92 @@
+From: ROCKNIX <noreply@rocknix.org>
+Date: Tue, 24 Jun 2026 00:00:00 +0000
+Subject: [PATCH] spi: spi-geni-qcom: cut per-transfer FIFO MMIO overhead
+
+For a steady stream of tiny FIFO transfers (the SM8750 KONKR gamepad MCU is
+polled at 250 Hz, several small SPI words per frame), each word pays a full
+set of barrier-synchronised device-bus accesses. Trim the per-transfer MMIO:
+  - skip the two DMA IRQ-status reads in the ISR when not in SE_DMA mode;
+  - cache TX/RX_TRANS_LEN and only rewrite on change (relaxed write, ordered
+    by the following M_CMD barrier); invalidate the cache on runtime suspend.
+---
+diff --git a/drivers/spi/spi-geni-qcom.c b/drivers/spi/spi-geni-qcom.c
+index d5fb0edc8e..1bdeedd3ef 100644
+--- a/drivers/spi/spi-geni-qcom.c
++++ b/drivers/spi/spi-geni-qcom.c
+@@ -86,6 +86,8 @@ struct spi_geni_master {
+ 	unsigned long cur_speed_hz;
+ 	unsigned long cur_sclk_hz;
+ 	unsigned int cur_bits_per_word;
++	u32 cur_tx_trans_len;		/* last value written to SE_SPI_TX_TRANS_LEN (0 = unknown) */
++	u32 cur_rx_trans_len;		/* last value written to SE_SPI_RX_TRANS_LEN */
+ 	unsigned int tx_rem_bytes;
+ 	unsigned int rx_rem_bytes;
+ 	const struct spi_transfer *cur_xfer;
+@@ -821,15 +823,29 @@ static int setup_se_xfer(struct spi_transfer *xfer,
+ 	len = get_xfer_len_in_words(xfer, mas);
+ 
+ 	mas->cur_xfer = xfer;
++	/*
++	 * TX/RX_TRANS_LEN persist in the SE across commands, so only rewrite
++	 * them when the length actually changes. For a steady stream of equal
++	 * transfers (e.g. the gamepad's 1-word reads at ~2750/s) this drops two
++	 * device-bus writes per transfer. The writes are relaxed; the M_CMD
++	 * write in geni_se_setup_m_cmd() carries the barrier that orders them
++	 * (and the FIFO fill) ahead of the command actually starting.
++	 */
+ 	if (xfer->tx_buf) {
+ 		m_cmd |= SPI_TX_ONLY;
+ 		mas->tx_rem_bytes = xfer->len;
+-		writel(len, se->base + SE_SPI_TX_TRANS_LEN);
++		if (mas->cur_tx_trans_len != len) {
++			writel_relaxed(len, se->base + SE_SPI_TX_TRANS_LEN);
++			mas->cur_tx_trans_len = len;
++		}
+ 	}
+ 
+ 	if (xfer->rx_buf) {
+ 		m_cmd |= SPI_RX_ONLY;
+-		writel(len, se->base + SE_SPI_RX_TRANS_LEN);
++		if (mas->cur_rx_trans_len != len) {
++			writel_relaxed(len, se->base + SE_SPI_RX_TRANS_LEN);
++			mas->cur_rx_trans_len = len;
++		}
+ 		mas->rx_rem_bytes = xfer->len;
+ 	}
+ 
+@@ -909,8 +925,19 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
+ 	u32 m_irq, dma_tx_status, dma_rx_status;
+ 
+ 	m_irq = readl(se->base + SE_GENI_M_IRQ_STATUS);
+-	dma_tx_status = readl_relaxed(se->base + SE_DMA_TX_IRQ_STAT);
+-	dma_rx_status = readl_relaxed(se->base + SE_DMA_RX_IRQ_STAT);
++	/*
++	 * The DMA IRQ-status registers are only meaningful in SE_DMA mode.
++	 * Reading them costs two extra device-bus round trips per interrupt,
++	 * which is pure waste in FIFO mode (e.g. the KONKR gamepad polled at
++	 * ~2750 small transfers/s). Skip them unless we're actually in DMA mode.
++	 */
++	if (mas->cur_xfer_mode == GENI_SE_DMA) {
++		dma_tx_status = readl_relaxed(se->base + SE_DMA_TX_IRQ_STAT);
++		dma_rx_status = readl_relaxed(se->base + SE_DMA_RX_IRQ_STAT);
++	} else {
++		dma_tx_status = 0;
++		dma_rx_status = 0;
++	}
+ 
+ 	if (!m_irq && !dma_tx_status && !dma_rx_status)
+ 		return IRQ_NONE;
+@@ -1139,6 +1166,13 @@ static int __maybe_unused spi_geni_runtime_suspend(struct device *dev)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Resources are off and the SE may lose register state, so invalidate
++	 * the cached TRANS_LEN values; the next transfer will rewrite them.
++	 */
++	mas->cur_tx_trans_len = 0;
++	mas->cur_rx_trans_len = 0;
++
+ 	return geni_icc_disable(&mas->se);
+ }
+ 

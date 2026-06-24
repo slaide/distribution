@@ -37,7 +37,7 @@ new file mode 100644
 index 0000000..f66adc811
 --- /dev/null
 +++ b/drivers/input/joystick/mcu_joystick.c
-@@ -0,0 +1,711 @@
+@@ -0,0 +1,793 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * AYANEO SPI MCU gamepad driver (KONKR Pocket FIT Elite / AYN AYANEO SM8750 family)
@@ -83,10 +83,13 @@ index 0000000..f66adc811
 + * TLMM gpio-keys (currently electrically silent; separate bring-up).
 + * History in PORTING-LOG §7ag..§7as.
 + *
-+ * If the MCU stops answering (header gone — seen once after ack-less sysfs
-+ * reads ran alongside the poll stream), the poll path auto-recovers:
-+ * release all inputs, re-send the init commands, and after repeated
-+ * failures redo the full power-on dance.
++ * If the MCU desyncs (frames stop carrying the "AYANEO" header — seen when it
++ * drops an SPI word and its pipelined read shifts by a register), a watchdog
++ * recovers it: release all inputs, re-send the init commands, and after
++ * repeated failures redo the full power-on dance. The watchdog keys off the
++ * last header-VALIDATED frame, NOT off transfer success or the frame IRQ — a
++ * desynced MCU keeps toggling its IRQ and keeps completing (garbage) transfers,
++ * so those are not liveness signals.
 + */
 +#include <linux/bitops.h>
 +#include <linux/delay.h>
@@ -130,7 +133,29 @@ index 0000000..f66adc811
 +#define MCU_REG_RUMBLE_WEAK	0x61
 +#define MCU_WRITE_WORD(reg, val)	((((reg) & 0x7f) << 8) | ((val) & 0xff))
 +
-+#define MCU_XFER_GAP_US		20	/* stock inter-word delay (probe sets 0x14) */
++/*
++ * Inter-word settling gap, busy-wait microseconds. The MCU's pipelined register
++ * engine needs a CS-idle window between 16-bit words to advance its internal read
++ * pointer; with no gap, two words occasionally land close enough that the MCU drops
++ * one and the whole frame shifts by a word (the "AYANEO" header then lands in a data
++ * slot) — a permanent desync until re-init. That is the "gamepad buttons die until a
++ * suspend/resume" failure.
++ *
++ * We busy-wait with udelay instead of usleep_range: the CPU win from dropping the
++ * gap was removing usleep_range's per-gap hrtimer arm + reschedule, NOT the ~20 us
++ * of wall time itself, so udelay restores a settling window without the scheduler
++ * cost. Tunable live via /sys/module/mcu_joystick/parameters/xfer_gap_us; raising it
++ * costs ~gap * word-rate CPU (~1800 words/s). 0 = the old desync-prone fast path.
++ *
++ * 20 is the stock vendor value and the verified floor: at 8 the MCU stream
++ * still stalled ~500 ms about every 12 s under a running Steam session (IRQ
++ * goes silent, watchdog re-init recovers it) — 0 stalls in a 5-minute soak at
++ * 20, and the whole IRQ thread still costs only ~2.5% of a little core.
++ */
++static unsigned int xfer_gap_us = 20;
++module_param(xfer_gap_us, uint, 0644);
++MODULE_PARM_DESC(xfer_gap_us,
++		 "SPI inter-word busy-wait settling gap in us (default 20; 0 disables)");
 +
 +/* stock xpad_set_up_abs: sticks are SIGNED s16 centered at 0 (so all-zero
 + * data at rest is NORMAL); triggers are two u8s packed into the 16-bit
@@ -147,8 +172,10 @@ index 0000000..f66adc811
 +					 * then skips its redundant SPI read and
 +					 * only re-arms as a wedge watchdog */
 +
-+#define MCU_DEAD_FRAMES		30	/* consecutive bad poll frames (~0.5 s)
-+					 * before declaring the MCU wedged */
++#define MCU_DEAD_MS		500	/* no header-validated frame for this long =>
++					 * MCU wedged/desynced; trigger recovery. Must
++					 * exceed the header-check period (MCU_HDR_EVERY
++					 * frames at ~250 Hz ~= 64 ms) with margin */
 +#define MCU_REINITS_BEFORE_DANCE 3	/* command re-sends before a full
 +					 * power cycle */
 +
@@ -227,7 +254,8 @@ index 0000000..f66adc811
 +	u8 ff_weak;
 +	int irq;
 +	unsigned long last_irq_frame;	/* jiffies of the last frame read by mcu_irq */
-+	unsigned int bad_frames;
++	unsigned long last_good_frame;	/* jiffies of the last header-VALIDATED frame */
++	unsigned int frame_ctr;		/* for header-validation decimation */
 +	unsigned int reinit_fails;
 +	bool dead;
 +	s16 prev[0x18];			/* last emitted value per control id (dedup) */
@@ -261,9 +289,15 @@ index 0000000..f66adc811
 + * the next register address on MOSI while clocking the PREVIOUS register's
 + * value in on MISO. So N registers take N+1 transfers, each its own CS with a
 + * ~20 us gap; out[i] is the value read on transfer i+1.
++ *
++ * The final (N+1th) transfer only exists to clock the last register's value in;
++ * its MOSI word is otherwise a don't-care. Callers pass it as @flush so a
++ * command word (e.g. the 0x7f01 keepalive) can ride that transfer instead of
++ * costing a separate one — the MCU acts on the MOSI command while we read the
++ * last value on MISO.
 + */
 +static int mcu_read_seq(struct mcu_joystick *mcu, const u16 *addrs,
-+			u16 *out, int n)
++			u16 *out, int n, u16 flush)
 +{
 +	int i, ret = 0;
 +
@@ -271,12 +305,19 @@ index 0000000..f66adc811
 +	for (i = 0; i <= n; i++) {
 +		u16 rx;
 +
-+		ret = mcu_xfer_word(mcu, i < n ? addrs[i] : 0, &rx);
++		ret = mcu_xfer_word(mcu, i < n ? addrs[i] : flush, &rx);
 +		if (ret)
 +			break;
 +		if (i > 0)
 +			out[i - 1] = rx;
-+		usleep_range(MCU_XFER_GAP_US, MCU_XFER_GAP_US + 2);
++		/*
++		 * Inter-word settling gap (see xfer_gap_us). Busy-wait, not
++		 * usleep_range: no per-gap hrtimer/reschedule cost, so it gives the
++		 * MCU its CS-idle window without the scheduler overhead the fast
++		 * path was built to avoid.
++		 */
++		if (xfer_gap_us)
++			udelay(xfer_gap_us);
 +	}
 +	mutex_unlock(&mcu->io_lock);
 +	return ret;
@@ -302,7 +343,7 @@ index 0000000..f66adc811
 +
 +static int mcu_read_frame(struct mcu_joystick *mcu, u16 regs[MCU_NREGS])
 +{
-+	return mcu_read_seq(mcu, mcu_frame_addrs, regs, MCU_NREGS);
++	return mcu_read_seq(mcu, mcu_frame_addrs, regs, MCU_NREGS, 0);
 +}
 +
 +static bool mcu_frame_hdr_ok(const u16 regs[MCU_NREGS])
@@ -442,27 +483,55 @@ index 0000000..f66adc811
 +}
 +
 +/* returns true if the frame header validated */
++/*
++ * Validate the "AYANEO" frame header only every Nth frame. mcu_frame_addrs
++ * lists the 6 data regs FIRST and the 3 header regs LAST, so a 6-reg read
++ * fetches exactly the gamepad data (key/sticks/triggers) and skips the header.
++ * Each header reg is a separate ~25 us SPI word on this GENI controller, so
++ * dropping the 3 header reads on 15 of every 16 frames cuts the per-frame SPI
++ * cost ~27% WITHOUT lowering the 250 Hz poll rate. A desync still self-corrects
++ * within MCU_HDR_EVERY frames (~64 ms) via the periodic header check.
++ */
++#define MCU_HDR_EVERY	16
++
 +static bool mcu_poll_once(struct mcu_joystick *mcu)
 +{
-+	u16 regs[MCU_NREGS];
-+
-+	if (mcu_read_frame(mcu, regs))
-+		return false;
++	u16 regs[MCU_NREGS] = {};
++	bool check_hdr = (mcu->frame_ctr++ % MCU_HDR_EVERY) == 0;
++	int nregs = check_hdr ? MCU_NREGS : MCU_FRAME_HDR;	/* full vs 6 data regs */
 +
 +	/*
-+	 * The stock poll loop sends 0x7f01 after EVERY frame read (disasm:
-+	 * poll_work_handler = read_data → w16r16({0x7f01},1) → report → requeue)
-+	 * — it is a per-frame keepalive/ACK, not a one-time "go". Without it
-+	 * the MCU keeps answering the header but never updates the data regs.
++	 * The stock poll loop sends the 0x7f01 keepalive/ACK after EVERY frame
++	 * read — without it the MCU answers the header but never updates the data
++	 * regs. We ride it on the read's flush word (last transfer) instead of a
++	 * separate transaction, so the keepalive is still delivered once per frame,
++	 * right after the data, at no extra SPI cost.
 +	 */
-+	mcu_write_word(mcu, MCU_CMD_START);
-+
-+	/* stock read_data: discard frames without the header magic */
-+	if (!mcu_frame_hdr_ok(regs)) {
-+		dev_dbg(&mcu->spi->dev, "head check failed: %04x %04x %04x\n",
-+			regs[MCU_FRAME_HDR], regs[MCU_FRAME_HDR + 1],
-+			regs[MCU_FRAME_HDR + 2]);
++	if (mcu_read_seq(mcu, mcu_frame_addrs, regs, nregs, MCU_CMD_START))
 +		return false;
++
++	/* stock read_data: discard frames without the header magic (only on the
++	 * frames where we actually read it) */
++	if (check_hdr) {
++		if (!mcu_frame_hdr_ok(regs)) {
++			dev_dbg(&mcu->spi->dev, "head check failed: %04x %04x %04x\n",
++				regs[MCU_FRAME_HDR], regs[MCU_FRAME_HDR + 1],
++				regs[MCU_FRAME_HDR + 2]);
++			return false;
++		}
++		/*
++		 * A validated header is the ONLY trustworthy liveness signal. A
++		 * desynced MCU still completes SPI transfers and still toggles its
++		 * IRQ, so transfer success (and thus last_irq_frame) says nothing
++		 * about whether the data is real — only the "AYANEO" magic does.
++		 * The wedge watchdog keys off this timestamp alone.
++		 */
++		mcu->last_good_frame = jiffies;
++		mcu->reinit_fails = 0;
++		if (mcu->dead) {
++			mcu->dead = false;
++			dev_info(&mcu->spi->dev, "MCU recovered\n");
++		}
 +	}
 +
 +	mcu_report(mcu, regs);
@@ -484,12 +553,47 @@ index 0000000..f66adc811
 +		container_of(work, struct mcu_joystick, poll_work.work);
 +
 +	/*
-+	 * The MCU free-runs its frame IRQ at ~250 Hz; while it is delivering
-+	 * frames, mcu_irq already reads each frame and sends the per-frame
-+	 * keepalive, so a poll read here is pure duplicate SPI traffic (and the
-+	 * extra keepalive even pokes the MCU for more frames). Skip the read
-+	 * while the IRQ is healthy and just re-arm as a wedge watchdog; only
-+	 * fall back to active polling once the IRQ has gone quiet.
++	 * Wedge watchdog. This MUST run even when the IRQ path looks healthy.
++	 * A desynced MCU keeps toggling its IRQ and keeps completing SPI
++	 * transfers, so last_irq_frame keeps advancing and the IRQ-health skip
++	 * below would fire forever while every frame fails validation — exactly
++	 * the "gamepad dead until a suspend/resume re-inits it" symptom. Liveness
++	 * is therefore tracked by last_good_frame (a header-VALIDATED frame), not
++	 * by transfer success, and recovery runs the moment valid frames stop,
++	 * regardless of IRQ liveness.
++	 */
++	if (time_after(jiffies,
++		       mcu->last_good_frame + msecs_to_jiffies(MCU_DEAD_MS))) {
++		if (!mcu->dead) {
++			mcu->dead = true;
++			mcu_report_idle(mcu);
++		}
++		if (mcu->reinit_fails++ < MCU_REINITS_BEFORE_DANCE) {
++			dev_warn_ratelimited(&mcu->spi->dev,
++					     "MCU wedged (%u ms, no valid frame); re-sending init commands (%u)\n",
++					     jiffies_to_msecs(jiffies - mcu->last_good_frame),
++					     mcu->reinit_fails);
++			mcu_send_init_cmds(mcu);
++		} else {
++			dev_warn_ratelimited(&mcu->spi->dev,
++					     "MCU still wedged; full power cycle\n");
++			mcu_power_dance(mcu);
++			mcu_send_init_cmds(mcu);
++			mcu->reinit_fails = 0;
++		}
++		/* force a header-checked read on the very next frame so recovery
++		 * is detected promptly instead of up to MCU_HDR_EVERY frames later */
++		mcu->frame_ctr = 0;
++		schedule_delayed_work(&mcu->poll_work, msecs_to_jiffies(MCU_POLL_MS));
++		return;
++	}
++
++	/*
++	 * IRQ is delivering frames: it already reads each one and sends the
++	 * per-frame keepalive, so a poll read here is pure duplicate SPI traffic
++	 * (and the extra keepalive even pokes the MCU for more frames). Skip the
++	 * read and just re-arm as the watchdog tick; only actively poll once the
++	 * IRQ has gone quiet.
 +	 */
 +	if (mcu->irq > 0 &&
 +	    time_before(jiffies, mcu->last_irq_frame + msecs_to_jiffies(MCU_IRQ_OK_MS))) {
@@ -497,37 +601,12 @@ index 0000000..f66adc811
 +		return;
 +	}
 +
-+	if (mcu_poll_once(mcu)) {
-+		mcu->bad_frames = 0;
-+		mcu->reinit_fails = 0;
-+		if (mcu->dead) {
-+			mcu->dead = false;
-+			dev_info(&mcu->spi->dev, "MCU recovered\n");
-+		}
-+	} else if (++mcu->bad_frames >= MCU_DEAD_FRAMES) {
-+		/*
-+		 * Sustained header loss: the MCU wedged or rebooted (it
-+		 * answers zeros until re-initialized). Recover instead of
-+		 * discarding frames forever with stale input state latched.
-+		 */
-+		mcu->bad_frames = 0;
-+		if (!mcu->dead) {
-+			mcu->dead = true;
-+			mcu_report_idle(mcu);
-+		}
-+		if (mcu->reinit_fails++ < MCU_REINITS_BEFORE_DANCE) {
-+			dev_warn_ratelimited(&mcu->spi->dev,
-+					     "MCU silent; re-sending init commands (%u)\n",
-+					     mcu->reinit_fails);
-+			mcu_send_init_cmds(mcu);
-+		} else {
-+			dev_warn_ratelimited(&mcu->spi->dev,
-+					     "MCU still silent; full power cycle\n");
-+			mcu_power_dance(mcu);
-+			mcu_send_init_cmds(mcu);
-+			mcu->reinit_fails = 0;
-+		}
-+	}
++	/*
++	 * IRQ quiet (or no IRQ wired): actively poll. Recovery is handled by the
++	 * watchdog above; mcu_poll_once stamps last_good_frame and clears the
++	 * dead flag when a header validates.
++	 */
++	mcu_poll_once(mcu);
 +	schedule_delayed_work(&mcu->poll_work, msecs_to_jiffies(MCU_POLL_MS));
 +}
 +
@@ -636,7 +715,7 @@ index 0000000..f66adc811
 +		};
 +		u16 hdr[3] = {};
 +
-+		ret = mcu_read_seq(mcu, hdr_addrs, hdr, 3);
++		ret = mcu_read_seq(mcu, hdr_addrs, hdr, 3, 0);
 +		dev_dbg(dev, "init head check (ret=%d): %04x %04x %04x (zeros are normal pre-command)\n",
 +			ret, hdr[0], hdr[1], hdr[2]);
 +	}
@@ -659,6 +738,9 @@ index 0000000..f66adc811
 +		if (ret)
 +			return dev_err_probe(dev, ret, "irq request failed\n");
 +	}
++
++	/* seed the wedge watchdog so it doesn't fire before the first frame */
++	mcu->last_good_frame = jiffies;
 +
 +	/* poll fallback (and primary path if no irq wired); also the recovery
 +	 * watchdog — it re-inits a silent MCU */
@@ -717,7 +799,7 @@ index 0000000..f66adc811
 +		mcu_send_init_cmds(mcu);
 +	}
 +
-+	mcu->bad_frames = 0;
++	mcu->last_good_frame = jiffies;
 +	mcu->reinit_fails = 0;
 +
 +	if (mcu->irq > 0)
