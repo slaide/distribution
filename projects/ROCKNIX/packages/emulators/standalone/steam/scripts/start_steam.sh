@@ -93,9 +93,8 @@ steam_debug_print() {
 steam_read_sway_geometry() {
   eval "$(swaymsg -t get_outputs | jq -r '
     .[] | select(.focused == true) |
-    "W=\(.current_mode.width) H=\(.current_mode.height) TRANSFORM=\(.transform) REFRESH=\(.current_mode.refresh // 60000)"
+    "W=\(.current_mode.width) H=\(.current_mode.height) TRANSFORM=\(.transform)"
   ')"
-  REFRESH_HZ=$((REFRESH / 1000))
 }
 
 steam_setup_environment() {
@@ -117,6 +116,16 @@ steam_scope_reexec_if_needed() {
       -E TZ="$TZ" \
       -- "${STEAM_MAIN_SCRIPT}" "$@"
   fi
+}
+
+steam_return_to_frontend() {
+  # Return to the configured boot frontend after Steam exits, instead of always
+  # dropping into EmulationStation. (system.frontend=steam still falls back to
+  # ES, which is its documented behaviour.)
+  case "$(get_setting system.frontend)" in
+    konkr-launcher) systemctl start konkr-launcher.service ;;
+    *)              systemctl start essway.service ;;
+  esac
 }
 
 steam_dual_screen_begin() {
@@ -169,10 +178,13 @@ steam_launch_bigpicture() {
       exit 0
     else
       systemctl stop sway
+      # No -r with --backend drm: gamescope scans out the panel's preferred
+      # mode but paces vsynced clients at -r, so a mismatched -r (e.g. sway's
+      # 60Hz on a 144Hz panel) beats against real vblanks and drops frames.
       GAMESCOPE_MODE_SAVE_FILE="${gamescope_mode_file}" GAMESCOPE_FAKE_OUTPUT_MM=508x286 env -u WAYLAND_DISPLAY LD_LIBRARY_PATH=/storage/.local/share/Steam/lib/aarch64-linux-gnu/ ${EMUPERF} \
-        gamescope $PREFER_OUTPUT -W "$W" -H "$H" -r "$REFRESH_HZ" --xwayland-count 2 --mangoapp --backend drm --force-orientation "${force_orientation}" --use-rotation-shader -e -- \
+        gamescope $PREFER_OUTPUT -W "$W" -H "$H" --xwayland-count 2 --mangoapp --backend drm --force-orientation "${force_orientation}" --use-rotation-shader -e -- \
         /storage/.local/share/Steam/steamrtarm64/steam -steamdeck -steamos3 -gamepadui -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders ${game_uri:+"$game_uri"}
-      systemctl start essway
+      steam_return_to_frontend
       exit 0
     fi
   else
@@ -183,9 +195,9 @@ steam_launch_bigpicture() {
     else
       systemctl stop sway
       GAMESCOPE_MODE_SAVE_FILE="${gamescope_mode_file}" GAMESCOPE_FAKE_OUTPUT_MM=508x286 env -u WAYLAND_DISPLAY ${EMUPERF} \
-        gamescope $PREFER_OUTPUT -W "$W" -H "$H" -r "$REFRESH_HZ" --xwayland-count 2 --mangoapp --backend drm --force-orientation "${force_orientation}" --use-rotation-shader -e -- \
+        gamescope $PREFER_OUTPUT -W "$W" -H "$H" --xwayland-count 2 --mangoapp --backend drm --force-orientation "${force_orientation}" --use-rotation-shader -e -- \
         FEX /usr/bin/steam -steamdeck -steamos3 -gamepadui -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders ${game_uri:+"$game_uri"}
-      systemctl start essway
+      steam_return_to_frontend
       exit 0
     fi
   fi
