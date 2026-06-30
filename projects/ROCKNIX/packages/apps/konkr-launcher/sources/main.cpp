@@ -107,31 +107,46 @@ static const int N_FEX_BOOLS = (int)(sizeof(FEX_BOOLS) / sizeof(*FEX_BOOLS));
 // Preset names (combo index 0 = Custom = "don't touch on select").
 static const char *PRESET_NAMES[] = {
     "Custom", "Stability", "Compatibility", "Intermediate",
-    "Performance", "Extreme", "Denuvo",
+    "PlayStation", "Performance", "Extreme", "Denuvo",
 };
 static const int N_PRESETS = (int)(sizeof(PRESET_NAMES) / sizeof(*PRESET_NAMES));
 
-// Tri-state table, columns match FEX_BOOLS order; rows are presets 1..6.
-// (GameNative's preset table.)  -1 default, 0 off, 1 on.
+// Tri-state table, columns match FEX_BOOLS order; rows are presets 1..7.
+// (GameNative's preset table, plus PlayStation.)  -1 default, 0 off, 1 on.
+//
+// PlayStation = Intermediate's fast TSO set but x87 at FULL precision: the
+// PlayStation PC SDK anti-tamper (all Sony ports post-GoW-Ragnarök: HZD
+// Remastered, Until Dawn, Spider-Man 2, TLOU2-R, ...) deliberately abuses
+// x87 precision and hangs or corrupts pointers under reduced precision
+// (FEX-Emu/FEX#4556, maintainer-verified per-game). Full TSO is NOT needed
+// for these titles — x87 is the only load-bearing flag.
 static const int PRESET_TRI[N_PRESETS][N_FEX_BOOLS] = {
     /* Custom        */ { -1,-1,-1,-1,-1,-1,-1,-1,-1,-1 },
     /* Stability     */ {  1, 1, 1, 1, 0, 0,-1,-1,-1,-1 },
     /* Compatibility */ {  1, 1, 1, 1, 0, 1,-1,-1,-1,-1 },
     /* Intermediate  */ {  1, 0, 0, 1, 1, 1,-1,-1,-1,-1 },
+    /* PlayStation   */ {  1, 0, 0, 1, 0, 1,-1,-1,-1,-1 },
     /* Performance   */ {  0, 0, 0, 0, 1, 1,-1,-1,-1,-1 },
     /* Extreme       */ {  0, 0, 0, 0, 1, 1, 1, 1,-1,-1 },
     /* Denuvo        */ {  0, 0, 0, 0, 1, 1, 1, 1, 1,-1 },
 };
 // SMCChecks per preset: 0 default, 1 none, 2 mtrack, 3 full.
-static const int PRESET_SMC[N_PRESETS] = { 0, 0, 0, 0, 0, 0, 3 };
+static const int PRESET_SMC[N_PRESETS] = { 0, 0, 0, 0, 0, 0, 0, 3 };
 static const char *SMC_VALUES[] = { "", "none", "mtrack", "full" };
 
-// A Turnip/Mesa/DXVK perf baseline (the levers that actually move render-bound
-// games on this stack — present mode, conformance, shader cache, esync).
+// A Turnip/Mesa/DXVK perf baseline. Deliberately NO TU_DEBUG flags and no
+// shader-cache size cap: TU_DEBUG values are part of Turnip's shader-cache
+// key, so toggling one invalidates the game's entire warm cache (a full
+// pipeline recompile — minutes-to-hours of single-digit fps on FEX), and a
+// cap below the game's working set (AAA caches run >0.7 GB) causes endless
+// eviction churn. WINEESYNC/WINEFSYNC are NOT inert here: proton-cachyos is
+// wine-tkg based, where sync is opt-in via these env vars (unlike Valve
+// Proton) — without them sync falls back to wineserver and sync-heavy games
+// hang or black-screen at launch.
 static const char *RECOMMENDED_ENV =
-    "MESA_VK_WSI_PRESENT_MODE=mailbox TU_DEBUG=noconform "
-    "MESA_SHADER_CACHE_DISABLE=false MESA_SHADER_CACHE_MAX_SIZE=512MB "
-    "mesa_glthread=true WINEESYNC=1";
+    "MESA_VK_WSI_PRESENT_MODE=mailbox "
+    "MESA_SHADER_CACHE_DISABLE=false mesa_glthread=true "
+    "WINEESYNC=1 WINEFSYNC=1";
 
 struct Tune {
     int tri[N_FEX_BOOLS];
@@ -356,6 +371,10 @@ static bool set_mapping(int appid, bool enable)
 {
     std::string path = config_vdf_path();
     std::string cfg = read_file(path);
+    // An existing config.vdf that reads back empty means the read failed, not
+    // that Steam has no config — bail rather than replace it with a skeleton.
+    if (cfg.empty() && access(path.c_str(), F_OK) == 0)
+        return false;
     KV root = parse_vdf(cfg);
     KV *cm = compat_mapping(root, true);
     if (!cm) return false;

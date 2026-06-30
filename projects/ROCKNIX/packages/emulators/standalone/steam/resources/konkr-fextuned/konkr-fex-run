@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# KONKR FEX-Tuned — a thin Proton-wrapping Steam compatibility tool.
+#
+# Steam runs this as a game's compatibility tool (selected per-game via
+# config.vdf CompatToolMapping, written by konkr-launcher's Steam tab). We look
+# up a per-game FEX profile keyed by the Steam AppID Steam hands us, export its
+# FEX_* (and any PROTON_*/DXVK_*/MANGOHUD) environment, then chain to the real
+# ROCKNIX Proton. FEX env vars override every FEX config file, so exporting them
+# here is all the per-game tuning we need — no Config.json surgery.
+
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+STEAM_ROOT="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-/storage/.local/share/Steam}"
+APPID="${STEAM_COMPAT_APP_ID:-${SteamAppId:-0}}"
+PROFILE_DIR="/storage/.config/fex-emu/per-game"
+DEFAULT="${PROFILE_DIR}/default.conf"   # baseline for every tuned game
+PROFILE="${PROFILE_DIR}/${APPID}.conf"  # optional per-game override (wins)
+
+mkdir -p "${PROFILE_DIR}"
+
+# Resolve the real Proton: prefer the registered default, then the newest
+# CachyOS build in compatibilitytools.d, then any other proton (never us).
+real_proton=""
+newest_cachyos=$(ls -d "${STEAM_ROOT}"/compatibilitytools.d/proton-cachyos-*-arm64 2>/dev/null | sort -V | tail -1)
+for cand in \
+  "${STEAM_ROOT}/steamapps/common/Proton 11.0 (ARM64)/proton" \
+  "${newest_cachyos}/proton"; do
+  if [ -x "$cand" ]; then real_proton="$cand"; break; fi
+done
+if [ -z "$real_proton" ]; then
+  for cand in "${STEAM_ROOT}"/compatibilitytools.d/*/proton; do
+    [ -x "$cand" ] || continue
+    case "$cand" in "${here}/"*) continue ;; esac
+    real_proton="$cand"; break
+  done
+fi
+
+for conf in "$DEFAULT" "$PROFILE"; do
+  if [ -f "$conf" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$conf"
+    set +a
+  fi
+done
+
+if [ -z "$real_proton" ]; then
+  echo "konkr-fex-run: no Proton found under ${STEAM_ROOT}" >&2
+  exit 1
+fi
+
+exec "$real_proton" "$@"

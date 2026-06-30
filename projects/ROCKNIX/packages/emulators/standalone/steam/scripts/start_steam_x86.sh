@@ -13,6 +13,7 @@ set_kill set "-9 FEX"
 . /usr/bin/start_steam.sh
 
 steam_ensure_fex_config_template
+steam_ensure_konkr_fextuned_tool
 steam_prepare_storage_and_vdf
 steam_load_es_thunk_settings "$@"
 steam_write_fex_config_json

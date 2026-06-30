@@ -188,6 +188,14 @@ install_proton_ge() {
     "GE-Proton*-aarch64"
 }
 
+install_konkr_fextuned_tool() {
+  log_info "Installing KONKR FEX-Tuned compatibility tool..."
+  local dest="${STEAM}/compatibilitytools.d/konkr-fextuned"
+  mkdir -p "${STEAM}/compatibilitytools.d"
+  cp -rf "/usr/share/steam/konkr-fextuned" "${STEAM}/compatibilitytools.d/" || die "Failed to install konkr-fextuned tool."
+  chmod +x "${dest}/konkr-fex-run" || die "Failed to chmod konkr-fex-run."
+}
+
 run_steam_first_launch() {
   log_info "Running Steam first launch routine..."
   echo 0 > /proc/sys/fs/binfmt_misc/x86_64 || true
@@ -221,6 +229,7 @@ install_steam_client_arm64
 install_bundled_proton_files
 install_proton_cachyos
 install_proton_ge
+install_konkr_fextuned_tool
 run_steam_first_launch
 
 echo ""

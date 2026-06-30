@@ -1,0 +1,17 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "konkr_fextuned" // Internal name; referenced by config.vdf CompatToolMapping.
+    {
+      // Self-contained tool: this manifest + toolmanifest.vdf + konkr-fex-run
+      // live together in this directory, so install_path is ".".
+      "install_path" "."
+
+      "display_name" "KONKR FEX-Tuned (Proton 11 ARM64)"
+
+      "from_oslist"  "windows"
+      "to_oslist"    "linux"
+    }
+  }
+}

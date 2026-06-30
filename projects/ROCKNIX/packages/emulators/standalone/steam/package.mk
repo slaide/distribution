@@ -31,4 +31,7 @@ makeinstall_target() {
   cp -rf ${PKG_DIR}/resources/compatibilitytool.vdf ${INSTALL}/usr/share/steam
   cp -rf ${PKG_DIR}/resources/toolmanifest.vdf ${INSTALL}/usr/share/steam
   cp -rf ${PKG_DIR}/resources/registry.vdf ${INSTALL}/usr/share/steam
+  # KONKR FEX-Tuned compatibility tool (per-game FEX env wrapper).
+  cp -rf ${PKG_DIR}/resources/konkr-fextuned ${INSTALL}/usr/share/steam
+  chmod 0755 ${INSTALL}/usr/share/steam/konkr-fextuned/konkr-fex-run
 }

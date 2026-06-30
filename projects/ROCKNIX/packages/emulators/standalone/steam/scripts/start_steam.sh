@@ -9,6 +9,18 @@ steam_ensure_fex_config_template() {
   fi
 }
 
+# Refresh the KONKR FEX-Tuned compatibility tool in the live Steam install, so
+# existing Steam installs pick it up without a full reinstall. Idempotent.
+steam_ensure_konkr_fextuned_tool() {
+  local src="/usr/share/steam/konkr-fextuned"
+  local dst="/storage/.local/share/Steam/compatibilitytools.d"
+  [ -d "$src" ] || return 0
+  [ -d "/storage/.local/share/Steam" ] || return 0
+  mkdir -p "$dst"
+  cp -rf "$src" "$dst/"
+  chmod +x "$dst/konkr-fextuned/konkr-fex-run" 2>/dev/null || true
+}
+
 steam_prepare_storage_and_vdf() {
   mkdir -p /storage/roms/steam/steamapps
   local vdf="/storage/.local/share/Steam/steamapps/libraryfolders.vdf"
