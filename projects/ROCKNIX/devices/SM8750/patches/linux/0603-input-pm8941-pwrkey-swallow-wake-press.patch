@@ -1,0 +1,83 @@
+From: Patrick Hennig <patrick.hennig@fastmail.com>
+Subject: [PATCH] input: pm8941-pwrkey: swallow wake press re-delivered at resume
+
+The PMIC latches the power-key press that wakes the system and the IRQ
+replays it after resume. The release-without-press then hits the
+simulated-press logic, so userspace sees a full short press it never
+made while awake (logind is inhibited by sleep.sh, but Steam calls
+login1 Suspend() directly and re-suspends the device 1-2s after wake).
+
+Arm a one-shot swallow across the suspend window: the first pwrkey IRQ
+after resume is dropped if it is a release-without-press, and a
+still-held wake press is hidden together with its release. Expires
+500ms after resume when the wake was not the power key.
+
+--- a/drivers/input/misc/pm8941-pwrkey.c
++++ b/drivers/input/misc/pm8941-pwrkey.c
+@@ -81,6 +81,8 @@
+ 	u32 sw_debounce_time_us;
+ 	ktime_t sw_debounce_end_time;
+ 	bool last_status;
++	ktime_t wake_swallow_until;
++	bool swallow_release;
+ 	const struct pm8941_data *data;
+ };
+ 
+@@ -172,6 +174,28 @@
+ 						pwrkey->sw_debounce_time_us);
+ 
+ 	/*
++	 * The press that wakes the system from suspend is latched by the PMIC
++	 * and delivered again on resume, where the simulated-press logic below
++	 * turns it into a full press+release pair. Userspace then acts on a
++	 * button press the user only made to wake the device (e.g. Steam
++	 * immediately re-suspends). Swallow the first event after resume: a
++	 * release-without-press is dropped entirely, and a still-held wake
++	 * press is hidden along with its upcoming release.
++	 */
++	if (ktime_before(ktime_get(), pwrkey->wake_swallow_until)) {
++		pwrkey->wake_swallow_until = 0;
++		if (!pwrkey->last_status) {
++			if (sts)
++				pwrkey->swallow_release = true;
++			return IRQ_HANDLED;
++		}
++	}
++	if (pwrkey->swallow_release && !sts) {
++		pwrkey->swallow_release = false;
++		return IRQ_HANDLED;
++	}
++
++	/*
+ 	 * Simulate a press event in case a release event occurred without a
+ 	 * corresponding press event.
+ 	 */
+@@ -224,8 +248,12 @@
+ {
+ 	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
+ 
+-	if (device_may_wakeup(dev))
++	if (device_may_wakeup(dev)) {
+ 		enable_irq_wake(pwrkey->irq);
++		/* Armed unbounded: the wake IRQ can replay before resume(). */
++		pwrkey->wake_swallow_until = KTIME_MAX;
++		pwrkey->swallow_release = false;
++	}
+ 
+ 	return 0;
+ }
+@@ -234,8 +262,13 @@
+ {
+ 	struct pm8941_pwrkey *pwrkey = dev_get_drvdata(dev);
+ 
+-	if (device_may_wakeup(dev))
++	if (device_may_wakeup(dev)) {
+ 		disable_irq_wake(pwrkey->irq);
++		/* Not consumed by a wake press: expire shortly after resume. */
++		if (pwrkey->wake_swallow_until == KTIME_MAX)
++			pwrkey->wake_swallow_until =
++				ktime_add_ms(ktime_get(), 500);
++	}
+ 
+ 	return 0;
+ }
