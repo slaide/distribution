@@ -37,6 +37,7 @@
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
 #include "theme.h"
+#include "steamfex.h"
 
 using json = nlohmann::json;
 
@@ -1795,6 +1796,207 @@ void tab_power()
     ImGui::TextUnformatted(gpu_line.c_str());
 }
 
+// ---------- Steam per-game FEX tuning ----------
+//
+// Same editor konkr-launcher's Steam tab exposes, but reachable here too — most
+// importantly from the --sidebar overlay, so FEX profiles can be tweaked while
+// Steam is already running. The FEX config is only read at game launch, so an
+// edit made in-game (via the sidebar) applies the next time that game starts.
+// Logic lives in steamfex.h (a copy of the launcher's namespace; the on-disk
+// profile + config.vdf format is the shared contract).
+
+static std::vector<steamfex::Game> sx_games;
+static bool sx_scanned = false;
+static int  sx_sel = 0;                 // index into sx_games, 0 = Default
+static steamfex::Tune sx_tune;          // profile being edited
+static steamfex::Tune sx_default_tune;  // snapshot of default.conf, for hints
+static bool sx_has_override = false;    // selected game has its own <appid>.conf
+static char sx_extra_buf[4096] = { 0 };
+static std::string sx_status;
+
+static void sx_rescan()
+{
+    sx_games = steamfex::scan_games();
+    sx_games.insert(sx_games.begin(),
+                    { steamfex::DEFAULT_APPID, "Default (all games)" });
+}
+
+static void sx_select(int i)
+{
+    sx_sel = i;
+    sx_status.clear();
+    steamfex::load_profile(steamfex::DEFAULT_APPID, sx_default_tune);
+    if (i < 0 || i >= (int)sx_games.size())
+        return;
+    int appid = sx_games[i].appid;
+    steamfex::load_profile(appid, sx_tune);
+    sx_has_override = steamfex::profile_exists(appid);
+    snprintf(sx_extra_buf, sizeof sx_extra_buf, "%s", sx_tune.extra.c_str());
+}
+
+// non-static: the sidebar (sidebar.cpp) calls this, like the other reused tabs
+void tab_steam()
+{
+    using namespace steamfex;
+
+    if (access(STEAM_ROOT, F_OK) != 0) {
+        ImGui::TextWrapped("Steam is not installed. FEX per-game tuning applies "
+                           "to Steam games running under Proton.");
+        return;
+    }
+    if (!sx_scanned) {
+        sx_rescan();
+        sx_scanned = true;
+        sx_select(0);   // open on Default so the editor isn't empty
+    }
+
+    const float fs = ImGui::GetFontSize();
+
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Per-game FEX tuning. Edits save to the game's profile and "
+                        "take effect on its next launch — safe to change in-game.");
+    ImGui::PopTextWrapPos();
+    if (ImGui::Button("Rescan games")) {
+        sx_rescan();
+        sx_select(sx_sel < (int)sx_games.size() ? sx_sel : 0);
+    }
+    ImGui::Separator();
+
+    // game selector (compact dropdown; works in the panel and the sidebar)
+    ImGui::TextUnformatted("Game");
+    ImGui::SetNextItemWidth(-1);
+    const char *preview = (sx_sel >= 0 && sx_sel < (int)sx_games.size())
+                              ? sx_games[sx_sel].name.c_str() : "(none)";
+    if (ImGui::BeginCombo("##game", preview)) {
+        for (int i = 0; i < (int)sx_games.size(); i++) {
+            if (ImGui::Selectable(sx_games[i].name.c_str(), i == sx_sel) && i != sx_sel)
+                sx_select(i);
+            if (i == 0)
+                ImGui::Separator();   // divide Default from installed games
+        }
+        ImGui::EndCombo();
+    }
+    if (sx_games.size() <= 1)
+        ImGui::TextDisabled("No installed Steam games found yet.");
+
+    ImGui::Separator();
+    if (sx_sel < 0 || sx_sel >= (int)sx_games.size())
+        return;
+
+    const Game &g = sx_games[sx_sel];
+    const bool is_default = (g.appid == DEFAULT_APPID);
+
+    if (is_default) {
+        ImGui::TextUnformatted("Default profile");
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("Baseline every tuned game inherits, unless it sets "
+                            "its own override.");
+        ImGui::PopTextWrapPos();
+    } else {
+        bool en = sx_tune.mapping;
+        if (ImGui::Checkbox("Use FEX tuning for this game", &en)) {
+            if (set_mapping(g.appid, en)) {
+                sx_tune.mapping = en;
+                sx_status = en ? "Enabled (config.vdf updated; may need a Steam "
+                                 "restart to register)."
+                               : "Disabled (stock Proton).";
+            } else {
+                sx_status = "config.vdf edit failed - set 'KONKR FEX-Tuned' in "
+                            "Steam > Properties > Compatibility.";
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(sx_has_override ? "[override]" : "[inherits Default]");
+    }
+    ImGui::Separator();
+
+    // preset
+    std::string presets;
+    for (int i = 0; i < N_PRESETS; i++) {
+        presets += PRESET_NAMES[i];
+        presets.push_back('\0');
+    }
+    ImGui::SetNextItemWidth(fs * 12.0f);
+    if (ImGui::Combo("Preset", &sx_tune.preset, presets.c_str()) && sx_tune.preset != 0)
+        apply_preset(sx_tune, sx_tune.preset);
+
+    ImGui::Separator();
+    ImGui::TextDisabled(is_default ? "FEX flags  ('FEX default' = global config)"
+                                   : "FEX flags  ('Inherit' = take Default's value)");
+    const char *tri_items = is_default ? "FEX default\0On\0Off\0" : "Inherit\0On\0Off\0";
+    for (int i = 0; i < N_FEX_BOOLS; i++) {
+        int idx = (sx_tune.tri[i] == -1) ? 0 : (sx_tune.tri[i] == 1 ? 1 : 2);
+        ImGui::PushID(i);
+        ImGui::SetNextItemWidth(fs * 8.0f);
+        if (ImGui::Combo(FEX_BOOLS[i].label, &idx, tri_items)) {
+            sx_tune.tri[i] = (idx == 0) ? -1 : (idx == 1 ? 1 : 0);
+            sx_tune.preset = 0;   // manual edit => Custom
+        }
+        if (!is_default && sx_tune.tri[i] == -1) {
+            int dv = sx_default_tune.tri[i];
+            ImGui::SameLine();
+            ImGui::TextDisabled("(default: %s)",
+                                dv == 1 ? "On" : dv == 0 ? "Off" : "FEX default");
+        }
+        ImGui::PopID();
+    }
+
+    const char *smc_items = is_default ? "FEX default\0none\0mtrack\0full\0"
+                                       : "Inherit\0none\0mtrack\0full\0";
+    ImGui::SetNextItemWidth(fs * 8.0f);
+    if (ImGui::Combo("SMC checks", &sx_tune.smc, smc_items))
+        sx_tune.preset = 0;
+    if (!is_default && sx_tune.smc == 0) {
+        int ds = sx_default_tune.smc;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(default: %s)", ds == 0 ? "FEX default" : SMC_VALUES[ds]);
+    }
+
+    ImGui::Separator();
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Environment variables (one KEY=VALUE per line). The lever "
+                        "for render-bound games (DXVK / Mesa / Turnip / wine).");
+    ImGui::PopTextWrapPos();
+    if (!is_default && !sx_default_tune.extra.empty() &&
+        ImGui::TreeNode("Inherited from Default (read-only)")) {
+        ImGui::TextDisabled("%s", sx_default_tune.extra.c_str());
+        ImGui::TreePop();
+    }
+    ImGui::InputTextMultiline("##extra", sx_extra_buf, sizeof sx_extra_buf,
+                              ImVec2(-1, fs * 6.0f));
+    if (ImGui::Button("Insert recommended")) {
+        size_t len = strlen(sx_extra_buf);
+        if (len && sx_extra_buf[len - 1] != '\n' && len + 1 < sizeof sx_extra_buf)
+            sx_extra_buf[len++] = '\n', sx_extra_buf[len] = '\0';
+        strncat(sx_extra_buf, RECOMMENDED_ENV, sizeof sx_extra_buf - strlen(sx_extra_buf) - 1);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("Turnip/Mesa/DXVK perf baseline");
+
+    ImGui::Separator();
+    const char *save_label = is_default ? "Save Default" : "Save override";
+    if (ImGui::Button(save_label)) {
+        sx_tune.extra = sx_extra_buf;
+        bool ok = save_profile(g.appid, sx_tune);
+        if (ok) sx_select(sx_sel);   // reload: refresh override/default state
+        sx_status = ok ? (is_default ? "Default saved." : "Override saved.")
+                       : "Failed to write profile.";
+    }
+    if (!is_default && sx_has_override) {
+        ImGui::SameLine();
+        if (ImGui::Button("Delete override")) {
+            delete_profile(g.appid);
+            sx_select(sx_sel);   // reload: flags revert to Inherit
+            sx_status = "Override deleted; game now inherits Default.";
+        }
+    }
+    if (!sx_status.empty()) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextWrapped("%s", sx_status.c_str());
+        ImGui::PopTextWrapPos();
+    }
+}
+
 // ---------- boot frontend ----------
 // Writes system.frontend; the SM8750 090-ui_service quirk reads it at boot to
 // pick UI_SERVICE (es=EmulationStation, steam=Steam Big Picture session,
@@ -2202,6 +2404,7 @@ int main(int argc, char **argv)
             static const bool has_rgb = access(LED_DIR, F_OK) == 0;
             static const bool has_imu = !find_iio_imu().empty();
             static const bool has_fan = !find_pwm().empty();
+            static const bool has_steam = access(steamfex::STEAM_ROOT, F_OK) == 0;
 
             if (ImGui::BeginTabItem("Gamepad")) {
                 tab_gamepad(gc);
@@ -2229,6 +2432,10 @@ int main(int argc, char **argv)
             }
             if (ImGui::BeginTabItem("Power")) {
                 tab_power();
+                ImGui::EndTabItem();
+            }
+            if (has_steam && ImGui::BeginTabItem("Steam")) {
+                tab_steam();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("System")) {
