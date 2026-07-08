@@ -36,6 +36,7 @@
 
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
+#include "theme.h"
 
 // ----------------------------------------------------------- small helpers
 
@@ -354,6 +355,28 @@ static void draw_ui(int uw, int uh)
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoBringToFrontOnFocus);
 
+    // compact header: brand + section label (left), clock (right). Decorative,
+    // so NoNav keeps it out of the gamepad focus chain.
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    if (g_font_bold) ImGui::PushFont(g_font_bold);
+    ImGui::TextColored(C_ACCENT, "KONKR");
+    if (g_font_bold) ImGui::PopFont();
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(C_DIM, "Quick Settings");
+    char clk[8] = "";
+    time_t tnow = time(nullptr);
+    struct tm tmv;
+    if (localtime_r(&tnow, &tmv) && strftime(clk, sizeof clk, "%H:%M", &tmv)) {
+        float cw = ImGui::CalcTextSize(clk).x;
+        ImGui::SameLine();
+        ImGui::SetCursorPosX((float)uw - cw - ImGui::GetStyle().WindowPadding.x);
+        ImGui::TextColored(C_TEXT, "%s", clk);
+    }
+    ImGui::PopItemFlag();
+    ImGui::Separator();
+    ImGui::Spacing();
+
     static const char *names[] = { "Quick", "Power", "Buttons", "Fan", "RGB" };
     static int tab = 0;
     static bool enter_content = false;   // tab bar -> content, handed this frame
@@ -481,9 +504,12 @@ static int run_sidebar_wayland()
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(1.92f);  // widget metrics (padding/spacing)
-    io.FontGlobalScale = 1.92f;              // text size
+    // slate/amber launcher theme + real vector fonts, scaled to the surface
+    // height (shared with the main panel via theme.h)
+    g_ui = g_h / 720.0f;
+    if (g_ui < 1.0f) g_ui = 1.0f;
+    theme_load_fonts(io, g_ui);
+    theme_apply_style(g_ui);
     ImGui_ImplOpenGL3_Init(nullptr);         // GLES2 (IMGUI_IMPL_OPENGL_ES2)
 
     resolve_backlight();
@@ -636,9 +662,10 @@ static int run_sidebar_x11()
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(1.92f);
-    io.FontGlobalScale = 1.92f;
+    g_ui = sh / 720.0f;
+    if (g_ui < 1.0f) g_ui = 1.0f;
+    theme_load_fonts(io, g_ui);
+    theme_apply_style(g_ui);
     ImGui_ImplSDL2_InitForSDLRenderer(win, ren);
     ImGui_ImplSDLRenderer2_Init(ren);
     // Don't let imgui_impl_sdl2 poll a controller — gamescope gives the overlay

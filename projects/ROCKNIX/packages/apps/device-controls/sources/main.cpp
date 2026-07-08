@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -35,8 +36,17 @@
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
+#include "theme.h"
 
 using json = nlohmann::json;
+
+// Shared UI state declared extern in theme.h; defined here (this is the primary
+// translation unit). sidebar.cpp reuses these — only one entry point runs per
+// process, so each loads its own fonts into its own ImGui atlas.
+float   g_ui        = 1.0f;
+ImFont *g_font      = nullptr;
+ImFont *g_font_bold = nullptr;
+ImFont *g_font_small = nullptr;
 
 static const char *KEY_DIR = "/sys/bus/serial/devices/serial1-0";
 static const char *LED_DIR = "/sys/class/leds/konkr:rgb:joysticks";
@@ -571,25 +581,29 @@ static bool fan_curve_plot(FanCurve &c, bool editable, int &sel,
     auto X = [&](double t) { return (float)(p0.x + t / 100.0 * size.x); };
     auto Y = [&](double s) { return (float)(p1.y - s / 255.0 * size.y); };
 
-    dl->AddRectFilled(p0, p1, IM_COL32(28, 28, 34, 255));
+    const ImU32 col_grid = ImGui::GetColorU32(C_TILE);
+    const ImU32 col_lbl  = ImGui::GetColorU32(C_DIM);
+    dl->AddRectFilled(p0, p1, col_grid);
+    dl->AddRect(p0, p1, ImGui::GetColorU32(dc_rgb(0x2A3340)), 0, 0, 1.0f);
     char lab[16];
     for (int t = 10; t <= 100; t += 10) {
         dl->AddLine(ImVec2(X(t), p0.y), ImVec2(X(t), p1.y),
                     IM_COL32(255, 255, 255, t % 20 ? 10 : 25));
         if (t % 20 == 0) {
             snprintf(lab, sizeof lab, "%dC", t);
-            dl->AddText(ImVec2(X(t) + 2, p1.y - 16), IM_COL32(160, 160, 170, 200), lab);
+            dl->AddText(ImVec2(X(t) + 2, p1.y - 16), col_lbl, lab);
         }
     }
     for (int s = 51; s <= 255; s += 51) {	// 20% steps
         dl->AddLine(ImVec2(p0.x, Y(s)), ImVec2(p1.x, Y(s)), IM_COL32(255, 255, 255, 18));
         snprintf(lab, sizeof lab, "%d%%", s * 100 / 255);
-        dl->AddText(ImVec2(p0.x + 2, Y(s) + 1), IM_COL32(160, 160, 170, 200), lab);
+        dl->AddText(ImVec2(p0.x + 2, Y(s) + 1), col_lbl, lab);
     }
 
     // the curve, drawn exactly as the daemon evaluates it: linear segments
-    // between points; a zero-speed floor stays off up to the point above it
-    ImU32 ccol = editable ? IM_COL32(120, 200, 255, 255) : IM_COL32(150, 150, 165, 255);
+    // between points; a zero-speed floor stays off up to the point above it.
+    // Cyan while editable (draggable data), dim grey when read-only.
+    ImU32 ccol = editable ? ImGui::GetColorU32(C_INFO) : ImGui::GetColorU32(C_DIM);
     float prev_x, prev_y;
     int first = 6;
     if (c.speed[7] == 0) {
@@ -616,10 +630,11 @@ static bool fan_curve_plot(FanCurve &c, bool editable, int &sel,
     // pwm at that temp (hollow) — they separate while the daemon lags
     if (temp_now > 0.0) {
         float x = X(temp_now > 100.0 ? 100.0 : temp_now);
-        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(255, 170, 60, 160), 1.5f);
+        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y),
+                    ImGui::GetColorU32(dc_rgb(0xF0A83C, 0.63f)), 1.5f);
         dl->AddCircle(ImVec2(x, Y(fan_curve_eval(c, temp_now))), 6.0f,
-                      IM_COL32(255, 170, 60, 200), 0, 1.5f);
-        dl->AddCircleFilled(ImVec2(x, Y(pwm_now)), 4.0f, IM_COL32(255, 170, 60, 255));
+                      ImGui::GetColorU32(dc_rgb(0xF0A83C, 0.78f)), 0, 1.5f);
+        dl->AddCircleFilled(ImVec2(x, Y(pwm_now)), 4.0f, ImGui::GetColorU32(C_ACCENT));
     }
 
     bool changed = false;
@@ -710,7 +725,7 @@ static void tab_gamepad(SDL_GameController *gc)
 
     if (capturing()) {
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+        ImGui::TextColored(C_ACCENT,
                            "CAPTURING %us — UI nav disabled",
                            (g_capture_until - SDL_GetTicks()) / 1000 + 1);
     } else {
@@ -753,11 +768,10 @@ static void tab_gamepad(SDL_GameController *gc)
             ImGui::SameLine();
         if (col > 5)
             col = 0;
-        ImGui::PushStyleColor(ImGuiCol_Button,
-                              on ? ImVec4(0.2f, 0.8f, 0.2f, 1.0f)
-                                 : ImVec4(0.25f, 0.25f, 0.25f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? C_OK : C_TILE);
+        ImGui::PushStyleColor(ImGuiCol_Text, on ? C_BG : C_DIM);
         ImGui::SmallButton(bd.n);
-        ImGui::PopStyleColor();
+        ImGui::PopStyleColor(2);
     }
 
     ImGui::Separator();
@@ -793,9 +807,7 @@ static void tab_gamepad(SDL_GameController *gc)
         { "Front-top-right (F15)",   g_fkey[4] },
     };
     for (auto &r : sysrows) {
-        ImGui::TextColored(r.on ? ImVec4(0.3f, 0.9f, 0.3f, 1.0f)
-                                : ImVec4(0.45f, 0.45f, 0.45f, 1.0f),
-                           r.on ? "[#]" : "[ ]");
+        ImGui::TextColored(r.on ? C_OK : C_DIM, r.on ? "[#]" : "[ ]");
         ImGui::SameLine();
         ImGui::TextUnformatted(r.label);
     }
@@ -1466,8 +1478,11 @@ static void tab_display()
     ImGui::TextDisabled("Set refresh rate");
     for (size_t i = 0; i < modes.size(); i++) {
         bool active = modes[i].label == cur_refresh;
-        if (active)
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.45f, 0.20f, 1.f));
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, C_ACCENT_BG);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dc_rgb(0xF0A83C, 0.26f));
+            ImGui::PushStyleColor(ImGuiCol_Text, C_ACCENT);
+        }
         char blbl[16];
         snprintf(blbl, sizeof blbl, "%s Hz", modes[i].label.c_str());
         if (ImGui::Button(blbl)) {
@@ -1479,7 +1494,7 @@ static void tab_display()
             inited = false;   // re-read current
         }
         if (active)
-            ImGui::PopStyleColor();
+            ImGui::PopStyleColor(3);
         if (i + 1 < modes.size())
             ImGui::SameLine();
     }
@@ -1890,7 +1905,7 @@ static void tab_system()
     for (auto &p : parts) {
         bool ours = (p.label == "ROCKNIX" || p.label == "STORAGE");
         if (!ours)
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.65f, 0.35f, 1.f));
+            ImGui::PushStyleColor(ImGuiCol_Text, C_ACCENT);
         ImGui::Text("  %-12s %9s   %s", p.label.c_str(), human_gib(p.bytes).c_str(),
                     ours ? "ROCKNIX" : "Android / reserved");
         if (!ours)
@@ -1922,6 +1937,137 @@ static void tab_system()
     ImGui::Separator();
     if (ImGui::Button("Refresh"))
         inited = false;
+}
+
+// ---------- header / footer chrome (konkr-launcher family look) ----------
+
+// first system battery under /sys/class/power_supply (type=Battery, not
+// scope=Device which is what peripheral batteries report); "" if none
+static std::string find_battery_dir()
+{
+    DIR *d = opendir("/sys/class/power_supply");
+    if (!d)
+        return "";
+    std::string found;
+    for (dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.')
+            continue;
+        std::string dir = std::string("/sys/class/power_supply/") + e->d_name;
+        char buf[32];
+        if (!read_file(dir + "/type", buf, sizeof buf) || strncmp(buf, "Battery", 7) != 0)
+            continue;
+        if (read_file(dir + "/scope", buf, sizeof buf) && strncmp(buf, "Device", 6) == 0)
+            continue;
+        found = dir;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+
+static int  g_batt_cap = -1;
+static bool g_batt_charging = false;
+
+static void battery_poll()
+{
+    static Uint32 last = 0;
+    static std::string dir = find_battery_dir();
+    Uint32 now = SDL_GetTicks();
+    if (dir.empty() || (last != 0 && now - last < 4000))
+        return;
+    last = now;
+    char buf[32];
+    g_batt_cap = read_file(dir + "/capacity", buf, sizeof buf) ? atoi(buf) : -1;
+    g_batt_charging = false;
+    if (read_file(dir + "/status", buf, sizeof buf))
+        g_batt_charging = !strncmp(buf, "Charging", 8) || !strncmp(buf, "Full", 4);
+}
+
+// Fixed top bar: brand + app title (left), clock + battery (right). Decorative
+// and touch-only — invisible to gamepad nav, so it never steals focus.
+static void draw_header(float width, float height)
+{
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, C_PANEL);
+    ImGui::BeginChild("##hdr", ImVec2(width, height), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float u = g_ui;
+    const float pad = 22 * u;
+    const ImVec2 org = ImGui::GetWindowPos();
+    const float fs = ImGui::GetFontSize();
+
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+
+    ImFont *bf = g_font_bold ? g_font_bold : ImGui::GetFont();
+    float bh = bf->FontSize;
+    float by = org.y + (height - bh) / 2;
+    dl->AddText(bf, bh, ImVec2(org.x + pad, by), ImGui::GetColorU32(C_ACCENT), "KONKR");
+    float x = pad + bf->CalcTextSizeA(bh, FLT_MAX, 0, "KONKR").x + 14 * u;
+    dl->AddText(ImVec2(org.x + x, org.y + (height - fs) / 2),
+                ImGui::GetColorU32(C_TEXT), "Device Controls");
+
+    // right block: clock, then battery icon + percent
+    char clock[8] = "";
+    time_t t = time(nullptr);
+    struct tm tm;
+    if (localtime_r(&t, &tm))
+        strftime(clock, sizeof clock, "%H:%M", &tm);
+    char pct[16] = "";
+    if (g_batt_cap >= 0)
+        snprintf(pct, sizeof pct, "%d%%", g_batt_cap > 100 ? 100 : g_batt_cap);
+    float icon_h = fs * 0.62f;
+    float icon_w = g_batt_cap >= 0 ? icon_h * 1.85f + 3.5f * u : 0;
+    float clock_w = ImGui::CalcTextSize(clock).x;
+    float pct_w = ImGui::CalcTextSize(pct).x;
+    float gap = 10 * u;
+    float total = clock_w + (g_batt_cap >= 0 ? 2 * gap + icon_w + gap * 0.6f + pct_w : 0);
+    float rx = org.x + width - pad - total;
+    float cy = org.y + height / 2;
+    dl->AddText(ImVec2(rx, cy - fs / 2), ImGui::GetColorU32(C_TEXT), clock);
+    if (g_batt_cap >= 0) {
+        rx += clock_w + 2 * gap;
+        dc_battery_icon(dl, ImVec2(rx, cy - icon_h / 2), icon_h,
+                        g_batt_cap, g_batt_charging, u);
+        rx += icon_w + gap * 0.6f;
+        dl->AddText(ImVec2(rx, cy - fs / 2), ImGui::GetColorU32(C_DIM), pct);
+    }
+
+    ImGui::PopItemFlag();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
+// Fixed bottom bar: controller-hint pills + a touch-only Quit button. NoNav, so
+// gamepad quits via the L1+R1+Start combo (reminded by a pill); touch taps Quit.
+// Returns true if Quit was tapped.
+static bool draw_footer(float width, float height)
+{
+    bool quit = false;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, C_PANEL);
+    ImGui::BeginChild("##ftr", ImVec2(width, height), ImGuiChildFlags_None,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+    const float u = g_ui;
+
+    if (g_font_small) ImGui::PushFont(g_font_small);
+    float line_h = ImGui::GetTextLineHeight() + 5 * u;
+    ImGui::SetCursorPos(ImVec2(22 * u, (height - line_h) / 2));
+    dc_hint("A", "Select", u);
+    dc_hint("B", "Back", u);
+    dc_hint("LB+RB+Start", "Quit", u);
+    if (g_font_small) ImGui::PopFont();
+
+    // touch-only Quit on the right (NoNav keeps it off gamepad nav; the combo
+    // is the gamepad path). Mouse/touch clicks still register under NoNav.
+    float bw = 92 * u, bh = height - 12 * u;
+    ImGui::SetCursorPos(ImVec2(width - bw - 22 * u, (height - bh) / 2));
+    if (ImGui::Button("Quit", ImVec2(bw, bh)))
+        quit = true;
+
+    ImGui::PopItemFlag();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+    return quit;
 }
 
 // ---------- main ----------
@@ -1957,13 +2103,16 @@ int main(int argc, char **argv)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad |
                       ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
-    ImGui::StyleColorsDark();
-    // handheld: scale for a ~6" 1080p-class panel
+
+    // real vector fonts at native pixel size + the slate/amber launcher theme,
+    // scaled to the panel height (replaces StyleColorsDark + the scaled bitmap
+    // default font, which was the biggest "prototype look" tell)
     int w = 0, h = 0;
     SDL_GetWindowSize(win, &w, &h);
-    float scale = (w >= 1600) ? 2.5f : 2.0f;
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    io.FontGlobalScale = scale;
+    g_ui = h / 720.0f;
+    if (g_ui < 1.0f) g_ui = 1.0f;
+    theme_load_fonts(io, g_ui);
+    theme_apply_style(g_ui);
 
     ImGui_ImplSDL2_InitForSDLRenderer(win, ren);
     ImGui_ImplSDLRenderer2_Init(ren);
@@ -2018,6 +2167,8 @@ int main(int argc, char **argv)
         else
             io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 
+        battery_poll();
+
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
@@ -2025,12 +2176,25 @@ int main(int argc, char **argv)
         const ImGuiViewport *vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
         ImGui::SetNextWindowSize(vp->WorkSize);
-        // NOT NoDecoration: that implies NoScrollbar, and tab content
-        // (e.g. the color picker at handheld UI scale) can exceed the screen
+        // full-screen frame with flush header/footer bars: zero window padding
+        // on the outer window, real padding restored inside the content child
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
         ImGui::Begin("Device Controls", nullptr,
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove);
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::PopStyleVar();
 
+        const float hdr_h = 60 * g_ui;
+        const float ftr_h = 48 * g_ui;
+        draw_header(vp->WorkSize.x, hdr_h);
+
+        // content: the tab bar + active tab in its own scrollable region, so the
+        // header/footer stay pinned (tab content e.g. the color picker at
+        // handheld scale can exceed the screen height)
+        ImGui::SetCursorPos(ImVec2(0, hdr_h));
+        ImGui::BeginChild("##content", ImVec2(0, vp->WorkSize.y - hdr_h - ftr_h),
+                          ImGuiChildFlags_AlwaysUseWindowPadding);
         if (ImGui::BeginTabBar("tabs")) {
             /* Probe device-specific hardware once: this image is shared across
              * SM8750 handhelds, so hide the tabs whose hardware is absent. */
@@ -2077,12 +2241,11 @@ int main(int argc, char **argv)
             }
             ImGui::EndTabBar();
         }
+        ImGui::EndChild();
 
-        ImGui::Separator();
-        if (ImGui::Button("Quit"))
+        ImGui::SetCursorPos(ImVec2(0, vp->WorkSize.y - ftr_h));
+        if (draw_footer(vp->WorkSize.x, ftr_h))
             quit = true;
-        ImGui::SameLine();
-        ImGui::TextDisabled("(L1+R1+Start also quits)");
         if (gc && !capturing() &&
             SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) &&
             SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) &&
@@ -2091,7 +2254,8 @@ int main(int argc, char **argv)
 
         ImGui::End();
         ImGui::Render();
-        SDL_SetRenderDrawColor(ren, 20, 20, 24, 255);
+        SDL_SetRenderDrawColor(ren, (Uint8)(C_BG.x * 255), (Uint8)(C_BG.y * 255),
+                               (Uint8)(C_BG.z * 255), 255);
         SDL_RenderClear(ren);
         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), ren);
         SDL_RenderPresent(ren);
