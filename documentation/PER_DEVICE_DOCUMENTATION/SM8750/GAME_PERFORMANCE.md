@@ -47,7 +47,9 @@ Stack: kernel 7.0.11, mesa 26.1.2, proton-cachyos 20260602 (wine-11.0, FEX-2604-
 | Config | Result |
 |---|---|
 | default launch (no `-dx12`) | crash during shader compilation, before main menu |
-| `-dx12`, 1080p low | in-game, ~9 fps |
+| `-dx12`, 1080p low | in-game, 12 fps |
+| `-dx12`, 720p low | in-game, 21 fps |
+| `-dx12`, 720p low, fsr3 high performance | in-game, 31 fps |
 
 `-dx12` is required to launch: without it the game crashes while compiling
 shaders before the main menu. With it you reach gameplay, but only ~9 fps at
