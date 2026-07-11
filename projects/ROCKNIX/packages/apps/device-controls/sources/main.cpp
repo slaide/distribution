@@ -2163,43 +2163,61 @@ static void clock_seed_manual()
     g_man_mi = lt.tm_min;
 }
 
-// Parse `timeinfo timezones` ("Region/City," lines, split on first '/') into
-// region -> cities, and locate the current zone. Read once (Refresh re-runs).
+// Recursively collect zone names under a continent dir, relative to base
+// (e.g. Europe -> "Stockholm", America -> "Argentina/Buenos_Aires").
+static void collect_zones(const std::string &base, const std::string &prefix,
+                          std::vector<std::string> &out)
+{
+    std::string dir = prefix.empty() ? base : base + "/" + prefix;
+    DIR *d = opendir(dir.c_str());
+    if (!d)
+        return;
+    for (dirent *e; (e = readdir(d));) {
+        if (e->d_name[0] == '.')
+            continue;
+        std::string rel  = prefix.empty() ? std::string(e->d_name) : prefix + "/" + e->d_name;
+        std::string full = dir + "/" + e->d_name;
+        DIR *sub = opendir(full.c_str());
+        if (sub) {                 // subdir (America/Argentina, ...) -> recurse
+            closedir(sub);
+            collect_zones(base, rel, out);
+        } else {
+            out.push_back(rel);    // a zone file/link
+        }
+    }
+    closedir(d);
+}
+
+// Enumerate the full zoneinfo tree (not the condensed zone1970.tab, which
+// collapses e.g. DE/DK/NO/SE all to Europe/Berlin) so every city - Stockholm
+// included - is selectable and the current zone matches. Read once.
 static void clock_load()
 {
     g_tz.clear();
-    std::string zones = run_cmd(". /etc/profile 2>/dev/null; timeinfo timezones 2>/dev/null");
-    size_t pos = 0;
-    while (pos < zones.size()) {
-        size_t nl = zones.find('\n', pos);
-        std::string line = zones.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
-        pos = (nl == std::string::npos) ? zones.size() : nl + 1;
-        while (!line.empty() && (line.back() == ',' || line.back() == '\r' || line.back() == ' '))
-            line.pop_back();
-        if (line.empty())
+    static const char *regions[] = {
+        "Africa", "America", "Antarctica", "Arctic", "Asia", "Atlantic",
+        "Australia", "Europe", "Indian", "Pacific",
+    };
+    for (const char *rg : regions) {
+        std::vector<std::string> cities;
+        collect_zones(std::string("/usr/share/zoneinfo/") + rg, "", cities);
+        if (cities.empty())
             continue;
-        size_t slash = line.find('/');
-        std::string region = (slash == std::string::npos) ? std::string("Other") : line.substr(0, slash);
-        std::string city   = (slash == std::string::npos) ? line : line.substr(slash + 1);
-        TzRegion *r = nullptr;
-        for (auto &tr : g_tz)
-            if (tr.name == region) { r = &tr; break; }
-        if (!r) {
-            g_tz.push_back({ region, {} });
-            r = &g_tz.back();
-        }
-        r->cities.push_back(city);
+        std::sort(cities.begin(), cities.end());
+        g_tz.push_back({ rg, cities });
     }
-    std::sort(g_tz.begin(), g_tz.end(),
-              [](const TzRegion &a, const TzRegion &b) { return a.name < b.name; });
-    for (auto &tr : g_tz)
-        std::sort(tr.cities.begin(), tr.cities.end());
 
-    std::string cur = run_cmd(". /etc/profile 2>/dev/null; timeinfo current_timezone 2>/dev/null");
-    while (!cur.empty() && (cur.back() == '\n' || cur.back() == '\r' || cur.back() == ' '))
-        cur.pop_back();
+    // Current zone = fully-resolved /etc/localtime, minus the zoneinfo prefix.
+    std::string cur;
+    char rp[4096];
+    if (realpath("/etc/localtime", rp)) {
+        const std::string pfx = "/usr/share/zoneinfo/";
+        std::string s = rp;
+        if (s.rfind(pfx, 0) == 0)
+            cur = s.substr(pfx.size());
+    }
     size_t s = cur.find('/');
-    std::string cr = (s == std::string::npos) ? std::string("Other") : cur.substr(0, s);
+    std::string cr = (s == std::string::npos) ? std::string() : cur.substr(0, s);
     std::string cc = (s == std::string::npos) ? cur : cur.substr(s + 1);
     g_tz_region = g_tz_city = 0;
     for (size_t i = 0; i < g_tz.size(); i++)
