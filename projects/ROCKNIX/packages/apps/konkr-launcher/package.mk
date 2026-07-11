@@ -19,6 +19,7 @@ make_target() {
   # the SDL2 + SDLRenderer2 backends (same stack as device-controls).
   ${CXX} ${CXXFLAGS} ${LDFLAGS} -std=c++17 \
     -I${PKG_BUILD} -I${PKG_BUILD}/backends \
+    -I${PKG_DIR}/../device-controls/sources \
     -I${SYSROOT_PREFIX}/usr/include/SDL2 -D_REENTRANT \
     ${PKG_DIR}/sources/main.cpp \
     ${PKG_BUILD}/imgui.cpp \

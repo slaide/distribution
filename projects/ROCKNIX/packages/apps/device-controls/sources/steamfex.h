@@ -143,6 +143,18 @@ static bool write_file(const std::string &path, const std::string &data)
     return ok;
 }
 
+static std::string run_cmd(const char *cmd)
+{
+    std::string out;
+    FILE *p = popen(cmd, "r");
+    if (!p) return out;
+    char line[256];
+    while (fgets(line, sizeof line, p))
+        out += line;
+    pclose(p);
+    return out;
+}
+
 // ---- minimal text VDF / KeyValues ----
 struct KV {
     std::string key;
@@ -529,6 +541,78 @@ static std::vector<Game> scan_games()
         return strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
     });
     return v;
+}
+
+// ---- stranded-save recovery (Proton "* BACKUP" folders) ----
+// When Proton reconfigures a prefix on a Proton-version change it renames the
+// game's Windows user-profile save dir to "<name> BACKUP" and leaves an empty
+// redirect (game shows "New Game"); Steam's remotecache still marks it synced,
+// so Cloud never re-downloads. Detect the BACKUP dirs and no-clobber-restore.
+
+struct SaveBackup {
+    std::string backup;   // ".../My Documents BACKUP"
+    std::string live;     // ".../My Documents"
+    std::string label;    // "My Documents"
+    int files = 0;
+};
+
+static std::string prefix_userdir(int appid)
+{
+    const char *libs[] = {
+        "/storage/.local/share/Steam/steamapps",
+        "/storage/roms/steam/steamapps",
+    };
+    char sub[128];
+    snprintf(sub, sizeof sub, "/compatdata/%d/pfx/drive_c/users/steamuser", appid);
+    for (const char *lib : libs) {
+        std::string p = std::string(lib) + sub;
+        if (access(p.c_str(), F_OK) == 0)
+            return p;
+    }
+    return "";
+}
+
+static std::vector<SaveBackup> scan_backups(int appid)
+{
+    std::vector<SaveBackup> out;
+    std::string base = prefix_userdir(appid);
+    if (base.empty()) return out;
+    DIR *d = opendir(base.c_str());
+    if (!d) return out;
+    const std::string suf = " BACKUP";
+    for (dirent *e; (e = readdir(d));) {
+        std::string n = e->d_name;
+        if (n.size() <= suf.size() ||
+            n.compare(n.size() - suf.size(), suf.size(), suf) != 0)
+            continue;
+        SaveBackup b;
+        b.backup = base + "/" + n;
+        b.label  = n.substr(0, n.size() - suf.size());
+        b.live   = base + "/" + b.label;
+        std::string cnt = run_cmd(("find '" + b.backup + "' -type f 2>/dev/null | wc -l").c_str());
+        b.files = atoi(cnt.c_str());
+        if (b.files > 0) out.push_back(b);
+    }
+    closedir(d);
+    return out;
+}
+
+// Fill files missing from the live dir, never overwrite (a newer post-rename
+// save is preserved). Handles subdirs and spaces; follows the My Documents ->
+// Documents symlink into the real target.
+static void restore_backup(const SaveBackup &b)
+{
+    std::string c =
+        "B='" + b.backup + "'; L='" + b.live + "'; "
+        "cd \"$B\" 2>/dev/null && find . -type f | while IFS= read -r f; do "
+        "d=\"$L/$f\"; [ -e \"$d\" ] || { mkdir -p \"$(dirname \"$d\")\"; cp -a \"$f\" \"$d\"; }; "
+        "done";
+    run_cmd(c.c_str());
+}
+
+static void remove_backup(const SaveBackup &b)
+{
+    run_cmd(("rm -rf '" + b.backup + "'").c_str());
 }
 
 } // namespace steamfex

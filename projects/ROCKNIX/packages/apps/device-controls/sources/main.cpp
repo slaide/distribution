@@ -37,7 +37,7 @@
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
 #include "theme.h"
-#include "steamfex.h"
+#include "steamfex_ui.h"
 
 using json = nlohmann::json;
 
@@ -1808,11 +1808,7 @@ void tab_power()
 static std::vector<steamfex::Game> sx_games;
 static bool sx_scanned = false;
 static int  sx_sel = 0;                 // index into sx_games, 0 = Default
-static steamfex::Tune sx_tune;          // profile being edited
-static steamfex::Tune sx_default_tune;  // snapshot of default.conf, for hints
-static bool sx_has_override = false;    // selected game has its own <appid>.conf
-static char sx_extra_buf[4096] = { 0 };
-static std::string sx_status;
+// (per-game tune/override/status state now lives in steamfex::draw_game_editor)
 
 static void sx_rescan()
 {
@@ -1823,93 +1819,10 @@ static void sx_rescan()
 
 static void sx_select(int i)
 {
-    sx_sel = i;
-    sx_status.clear();
-    steamfex::load_profile(steamfex::DEFAULT_APPID, sx_default_tune);
-    if (i < 0 || i >= (int)sx_games.size())
-        return;
-    int appid = sx_games[i].appid;
-    steamfex::load_profile(appid, sx_tune);
-    sx_has_override = steamfex::profile_exists(appid);
-    snprintf(sx_extra_buf, sizeof sx_extra_buf, "%s", sx_tune.extra.c_str());
+    sx_sel = i;   // the editor loads/saves its own state keyed on the game
 }
 
 // non-static: the sidebar (sidebar.cpp) calls this, like the other reused tabs
-// ---------- stranded-save recovery (Proton "* BACKUP" folders) ----------
-// When Proton reconfigures a prefix on a Proton-version change it renames the
-// game's Windows user-profile save dir to "<name> BACKUP" and leaves an empty
-// redirect, so the game shows "New Game". Steam's remotecache (outside the
-// prefix) still marks the saves synced, so Cloud never re-downloads. Detect the
-// BACKUP dirs and no-clobber-restore them into the live dir.
-
-struct SaveBackup {
-    std::string backup;   // ".../My Documents BACKUP"
-    std::string live;     // ".../My Documents"
-    std::string label;    // "My Documents"
-    int files = 0;
-};
-
-static std::string steam_prefix_userdir(int appid)
-{
-    const char *libs[] = {
-        "/storage/.local/share/Steam/steamapps",
-        "/storage/roms/steam/steamapps",
-    };
-    char sub[128];
-    snprintf(sub, sizeof sub, "/compatdata/%d/pfx/drive_c/users/steamuser", appid);
-    for (const char *lib : libs) {
-        std::string p = std::string(lib) + sub;
-        if (access(p.c_str(), F_OK) == 0)
-            return p;
-    }
-    return "";
-}
-
-static std::vector<SaveBackup> steam_scan_backups(int appid)
-{
-    std::vector<SaveBackup> out;
-    std::string base = steam_prefix_userdir(appid);
-    if (base.empty())
-        return out;
-    DIR *d = opendir(base.c_str());
-    if (!d)
-        return out;
-    const std::string suf = " BACKUP";
-    for (dirent *e; (e = readdir(d));) {
-        std::string n = e->d_name;
-        if (n.size() <= suf.size() ||
-            n.compare(n.size() - suf.size(), suf.size(), suf) != 0)
-            continue;
-        SaveBackup b;
-        b.backup = base + "/" + n;
-        b.label  = n.substr(0, n.size() - suf.size());
-        b.live   = base + "/" + b.label;
-        std::string cnt = run_cmd(("find '" + b.backup + "' -type f 2>/dev/null | wc -l").c_str());
-        b.files = atoi(cnt.c_str());
-        if (b.files > 0)
-            out.push_back(b);
-    }
-    closedir(d);
-    return out;
-}
-
-// Fill files missing from the live dir, never overwrite (a newer save the user
-// made post-rename is preserved). Handles subdirs and spaces in paths.
-static void steam_restore_backup(const SaveBackup &b)
-{
-    std::string c =
-        "B='" + b.backup + "'; L='" + b.live + "'; "
-        "cd \"$B\" 2>/dev/null && find . -type f | while IFS= read -r f; do "
-        "d=\"$L/$f\"; [ -e \"$d\" ] || { mkdir -p \"$(dirname \"$d\")\"; cp -a \"$f\" \"$d\"; }; "
-        "done";
-    run_cmd(c.c_str());
-}
-
-static void steam_remove_backup(const SaveBackup &b)
-{
-    run_cmd(("rm -rf '" + b.backup + "'").c_str());
-}
-
 void tab_steam()
 {
     using namespace steamfex;
@@ -1924,8 +1837,6 @@ void tab_steam()
         sx_scanned = true;
         sx_select(0);   // open on Default so the editor isn't empty
     }
-
-    const float fs = ImGui::GetFontSize();
 
     ImGui::PushTextWrapPos(0.0f);
     ImGui::TextDisabled("Per-game FEX tuning. Edits save to the game's profile and "
@@ -1958,156 +1869,7 @@ void tab_steam()
     if (sx_sel < 0 || sx_sel >= (int)sx_games.size())
         return;
 
-    const Game &g = sx_games[sx_sel];
-    const bool is_default = (g.appid == DEFAULT_APPID);
-
-    if (is_default) {
-        ImGui::TextUnformatted("Default profile");
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("Baseline every tuned game inherits, unless it sets "
-                            "its own override.");
-        ImGui::PopTextWrapPos();
-    } else {
-        bool en = sx_tune.mapping;
-        if (ImGui::Checkbox("Use FEX tuning for this game", &en)) {
-            if (set_mapping(g.appid, en)) {
-                sx_tune.mapping = en;
-                sx_status = en ? "Enabled (config.vdf updated; may need a Steam "
-                                 "restart to register)."
-                               : "Disabled (stock Proton).";
-            } else {
-                sx_status = "config.vdf edit failed - set 'KONKR FEX-Tuned' in "
-                            "Steam > Properties > Compatibility.";
-            }
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled(sx_has_override ? "[override]" : "[inherits Default]");
-    }
-    ImGui::Separator();
-
-    // ---- stranded saves recovery (Proton "* BACKUP") ----
-    if (!is_default) {
-        static std::vector<SaveBackup> sx_backups;
-        static int sx_backups_for = -999;
-        if (sx_backups_for != g.appid) {
-            sx_backups = steam_scan_backups(g.appid);
-            sx_backups_for = g.appid;
-        }
-        if (!sx_backups.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, C_ACCENT);
-            ImGui::TextUnformatted("Stranded saves found");
-            ImGui::PopStyleColor();
-            ImGui::PushTextWrapPos(0.0f);
-            ImGui::TextDisabled("Proton moved this game's save folder aside on a "
-                                "version change, so the game and Steam Cloud can't "
-                                "see the saves. Restore copies them back without "
-                                "overwriting anything newer.");
-            ImGui::PopTextWrapPos();
-            for (auto &b : sx_backups)
-                ImGui::BulletText("%s  -  %d file%s", b.label.c_str(), b.files,
-                                  b.files == 1 ? "" : "s");
-            if (ImGui::Button("Restore saves")) {
-                for (auto &b : sx_backups)
-                    steam_restore_backup(b);
-                sx_status = "Saves restored into the game folder.";
-                sx_backups_for = -999;   // rescan so counts refresh
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Delete backup")) {
-                for (auto &b : sx_backups)
-                    steam_remove_backup(b);
-                sx_status = "Backup folder(s) removed.";
-                sx_backups_for = -999;
-            }
-            ImGui::Separator();
-        }
-    }
-
-    // preset
-    std::string presets;
-    for (int i = 0; i < N_PRESETS; i++) {
-        presets += PRESET_NAMES[i];
-        presets.push_back('\0');
-    }
-    ImGui::SetNextItemWidth(fs * 12.0f);
-    if (ImGui::Combo("Preset", &sx_tune.preset, presets.c_str()) && sx_tune.preset != 0)
-        apply_preset(sx_tune, sx_tune.preset);
-
-    ImGui::Separator();
-    ImGui::TextDisabled(is_default ? "FEX flags  ('FEX default' = global config)"
-                                   : "FEX flags  ('Inherit' = take Default's value)");
-    const char *tri_items = is_default ? "FEX default\0On\0Off\0" : "Inherit\0On\0Off\0";
-    for (int i = 0; i < N_FEX_BOOLS; i++) {
-        int idx = (sx_tune.tri[i] == -1) ? 0 : (sx_tune.tri[i] == 1 ? 1 : 2);
-        ImGui::PushID(i);
-        ImGui::SetNextItemWidth(fs * 8.0f);
-        if (ImGui::Combo(FEX_BOOLS[i].label, &idx, tri_items)) {
-            sx_tune.tri[i] = (idx == 0) ? -1 : (idx == 1 ? 1 : 0);
-            sx_tune.preset = 0;   // manual edit => Custom
-        }
-        if (!is_default && sx_tune.tri[i] == -1) {
-            int dv = sx_default_tune.tri[i];
-            ImGui::SameLine();
-            ImGui::TextDisabled("(default: %s)",
-                                dv == 1 ? "On" : dv == 0 ? "Off" : "FEX default");
-        }
-        ImGui::PopID();
-    }
-
-    const char *smc_items = is_default ? "FEX default\0none\0mtrack\0full\0"
-                                       : "Inherit\0none\0mtrack\0full\0";
-    ImGui::SetNextItemWidth(fs * 8.0f);
-    if (ImGui::Combo("SMC checks", &sx_tune.smc, smc_items))
-        sx_tune.preset = 0;
-    if (!is_default && sx_tune.smc == 0) {
-        int ds = sx_default_tune.smc;
-        ImGui::SameLine();
-        ImGui::TextDisabled("(default: %s)", ds == 0 ? "FEX default" : SMC_VALUES[ds]);
-    }
-
-    ImGui::Separator();
-    ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextDisabled("Environment variables (one KEY=VALUE per line). The lever "
-                        "for render-bound games (DXVK / Mesa / Turnip / wine).");
-    ImGui::PopTextWrapPos();
-    if (!is_default && !sx_default_tune.extra.empty() &&
-        ImGui::TreeNode("Inherited from Default (read-only)")) {
-        ImGui::TextDisabled("%s", sx_default_tune.extra.c_str());
-        ImGui::TreePop();
-    }
-    ImGui::InputTextMultiline("##extra", sx_extra_buf, sizeof sx_extra_buf,
-                              ImVec2(-1, fs * 6.0f));
-    if (ImGui::Button("Insert recommended")) {
-        size_t len = strlen(sx_extra_buf);
-        if (len && sx_extra_buf[len - 1] != '\n' && len + 1 < sizeof sx_extra_buf)
-            sx_extra_buf[len++] = '\n', sx_extra_buf[len] = '\0';
-        strncat(sx_extra_buf, RECOMMENDED_ENV, sizeof sx_extra_buf - strlen(sx_extra_buf) - 1);
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("Turnip/Mesa/DXVK perf baseline");
-
-    ImGui::Separator();
-    const char *save_label = is_default ? "Save Default" : "Save override";
-    if (ImGui::Button(save_label)) {
-        sx_tune.extra = sx_extra_buf;
-        bool ok = save_profile(g.appid, sx_tune);
-        if (ok) sx_select(sx_sel);   // reload: refresh override/default state
-        sx_status = ok ? (is_default ? "Default saved." : "Override saved.")
-                       : "Failed to write profile.";
-    }
-    if (!is_default && sx_has_override) {
-        ImGui::SameLine();
-        if (ImGui::Button("Delete override")) {
-            delete_profile(g.appid);
-            sx_select(sx_sel);   // reload: flags revert to Inherit
-            sx_status = "Override deleted; game now inherits Default.";
-        }
-    }
-    if (!sx_status.empty()) {
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextWrapped("%s", sx_status.c_str());
-        ImGui::PopTextWrapPos();
-    }
+    steamfex::draw_game_editor(sx_games[sx_sel]);
 }
 
 // ---------- boot frontend ----------
