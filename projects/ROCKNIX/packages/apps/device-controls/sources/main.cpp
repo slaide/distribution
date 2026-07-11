@@ -1835,6 +1835,81 @@ static void sx_select(int i)
 }
 
 // non-static: the sidebar (sidebar.cpp) calls this, like the other reused tabs
+// ---------- stranded-save recovery (Proton "* BACKUP" folders) ----------
+// When Proton reconfigures a prefix on a Proton-version change it renames the
+// game's Windows user-profile save dir to "<name> BACKUP" and leaves an empty
+// redirect, so the game shows "New Game". Steam's remotecache (outside the
+// prefix) still marks the saves synced, so Cloud never re-downloads. Detect the
+// BACKUP dirs and no-clobber-restore them into the live dir.
+
+struct SaveBackup {
+    std::string backup;   // ".../My Documents BACKUP"
+    std::string live;     // ".../My Documents"
+    std::string label;    // "My Documents"
+    int files = 0;
+};
+
+static std::string steam_prefix_userdir(int appid)
+{
+    const char *libs[] = {
+        "/storage/.local/share/Steam/steamapps",
+        "/storage/roms/steam/steamapps",
+    };
+    char sub[128];
+    snprintf(sub, sizeof sub, "/compatdata/%d/pfx/drive_c/users/steamuser", appid);
+    for (const char *lib : libs) {
+        std::string p = std::string(lib) + sub;
+        if (access(p.c_str(), F_OK) == 0)
+            return p;
+    }
+    return "";
+}
+
+static std::vector<SaveBackup> steam_scan_backups(int appid)
+{
+    std::vector<SaveBackup> out;
+    std::string base = steam_prefix_userdir(appid);
+    if (base.empty())
+        return out;
+    DIR *d = opendir(base.c_str());
+    if (!d)
+        return out;
+    const std::string suf = " BACKUP";
+    for (dirent *e; (e = readdir(d));) {
+        std::string n = e->d_name;
+        if (n.size() <= suf.size() ||
+            n.compare(n.size() - suf.size(), suf.size(), suf) != 0)
+            continue;
+        SaveBackup b;
+        b.backup = base + "/" + n;
+        b.label  = n.substr(0, n.size() - suf.size());
+        b.live   = base + "/" + b.label;
+        std::string cnt = run_cmd(("find '" + b.backup + "' -type f 2>/dev/null | wc -l").c_str());
+        b.files = atoi(cnt.c_str());
+        if (b.files > 0)
+            out.push_back(b);
+    }
+    closedir(d);
+    return out;
+}
+
+// Fill files missing from the live dir, never overwrite (a newer save the user
+// made post-rename is preserved). Handles subdirs and spaces in paths.
+static void steam_restore_backup(const SaveBackup &b)
+{
+    std::string c =
+        "B='" + b.backup + "'; L='" + b.live + "'; "
+        "cd \"$B\" 2>/dev/null && find . -type f | while IFS= read -r f; do "
+        "d=\"$L/$f\"; [ -e \"$d\" ] || { mkdir -p \"$(dirname \"$d\")\"; cp -a \"$f\" \"$d\"; }; "
+        "done";
+    run_cmd(c.c_str());
+}
+
+static void steam_remove_backup(const SaveBackup &b)
+{
+    run_cmd(("rm -rf '" + b.backup + "'").c_str());
+}
+
 void tab_steam()
 {
     using namespace steamfex;
@@ -1909,6 +1984,44 @@ void tab_steam()
         ImGui::TextDisabled(sx_has_override ? "[override]" : "[inherits Default]");
     }
     ImGui::Separator();
+
+    // ---- stranded saves recovery (Proton "* BACKUP") ----
+    if (!is_default) {
+        static std::vector<SaveBackup> sx_backups;
+        static int sx_backups_for = -999;
+        if (sx_backups_for != g.appid) {
+            sx_backups = steam_scan_backups(g.appid);
+            sx_backups_for = g.appid;
+        }
+        if (!sx_backups.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, C_ACCENT);
+            ImGui::TextUnformatted("Stranded saves found");
+            ImGui::PopStyleColor();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("Proton moved this game's save folder aside on a "
+                                "version change, so the game and Steam Cloud can't "
+                                "see the saves. Restore copies them back without "
+                                "overwriting anything newer.");
+            ImGui::PopTextWrapPos();
+            for (auto &b : sx_backups)
+                ImGui::BulletText("%s  -  %d file%s", b.label.c_str(), b.files,
+                                  b.files == 1 ? "" : "s");
+            if (ImGui::Button("Restore saves")) {
+                for (auto &b : sx_backups)
+                    steam_restore_backup(b);
+                sx_status = "Saves restored into the game folder.";
+                sx_backups_for = -999;   // rescan so counts refresh
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Delete backup")) {
+                for (auto &b : sx_backups)
+                    steam_remove_backup(b);
+                sx_status = "Backup folder(s) removed.";
+                sx_backups_for = -999;
+            }
+            ImGui::Separator();
+        }
+    }
 
     // preset
     std::string presets;
