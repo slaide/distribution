@@ -2026,6 +2026,199 @@ static void frontend_set(int idx)
 // Merged System tab: boot-frontend selector + device / storage / live status.
 // (Folds in what used to be the separate Storage and Device tabs — the names
 // were too close to tell apart.)
+// ---------- clock / timezone (System tab) ----------
+
+struct TzRegion {
+    std::string name;
+    std::vector<std::string> cities;
+};
+static std::vector<TzRegion> g_tz;
+static int  g_tz_region = 0, g_tz_city = 0;
+static bool g_clock_loaded = false;
+static bool g_ntp_on = true;
+static int  g_man_y = 2026, g_man_mo = 1, g_man_d = 1, g_man_h = 0, g_man_mi = 0;
+
+static void clock_seed_manual()
+{
+    time_t now = time(nullptr);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    g_man_y = lt.tm_year + 1900;
+    g_man_mo = lt.tm_mon + 1;
+    g_man_d = lt.tm_mday;
+    g_man_h = lt.tm_hour;
+    g_man_mi = lt.tm_min;
+}
+
+// Parse `timeinfo timezones` ("Region/City," lines, split on first '/') into
+// region -> cities, and locate the current zone. Read once (Refresh re-runs).
+static void clock_load()
+{
+    g_tz.clear();
+    std::string zones = run_cmd(". /etc/profile 2>/dev/null; timeinfo timezones 2>/dev/null");
+    size_t pos = 0;
+    while (pos < zones.size()) {
+        size_t nl = zones.find('\n', pos);
+        std::string line = zones.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? zones.size() : nl + 1;
+        while (!line.empty() && (line.back() == ',' || line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+        if (line.empty())
+            continue;
+        size_t slash = line.find('/');
+        std::string region = (slash == std::string::npos) ? std::string("Other") : line.substr(0, slash);
+        std::string city   = (slash == std::string::npos) ? line : line.substr(slash + 1);
+        TzRegion *r = nullptr;
+        for (auto &tr : g_tz)
+            if (tr.name == region) { r = &tr; break; }
+        if (!r) {
+            g_tz.push_back({ region, {} });
+            r = &g_tz.back();
+        }
+        r->cities.push_back(city);
+    }
+    std::sort(g_tz.begin(), g_tz.end(),
+              [](const TzRegion &a, const TzRegion &b) { return a.name < b.name; });
+    for (auto &tr : g_tz)
+        std::sort(tr.cities.begin(), tr.cities.end());
+
+    std::string cur = run_cmd(". /etc/profile 2>/dev/null; timeinfo current_timezone 2>/dev/null");
+    while (!cur.empty() && (cur.back() == '\n' || cur.back() == '\r' || cur.back() == ' '))
+        cur.pop_back();
+    size_t s = cur.find('/');
+    std::string cr = (s == std::string::npos) ? std::string("Other") : cur.substr(0, s);
+    std::string cc = (s == std::string::npos) ? cur : cur.substr(s + 1);
+    g_tz_region = g_tz_city = 0;
+    for (size_t i = 0; i < g_tz.size(); i++)
+        if (g_tz[i].name == cr) {
+            g_tz_region = (int)i;
+            for (size_t j = 0; j < g_tz[i].cities.size(); j++)
+                if (g_tz[i].cities[j] == cc) { g_tz_city = (int)j; break; }
+            break;
+        }
+
+    std::string ntp = run_cmd("timedatectl show -p NTP --value 2>/dev/null");
+    g_ntp_on = (ntp.rfind("yes", 0) == 0);
+    clock_seed_manual();
+    g_clock_loaded = true;
+}
+
+// Persist a zone change everywhere ROCKNIX reads it (mirrors steamos-set-timezone),
+// then tzset() so this app's own live readout updates immediately.
+static void clock_apply_tz()
+{
+    if (g_tz.empty() || g_tz[g_tz_region].cities.empty())
+        return;
+    const std::string tz = g_tz[g_tz_region].name + "/" + g_tz[g_tz_region].cities[g_tz_city];
+    std::string c =
+        ". /etc/profile 2>/dev/null; "
+        "set_setting system.timezone '" + tz + "'; "
+        "printf 'TIMEZONE=%s' '" + tz + "' > /storage/.cache/timezone; "
+        "printf '%s' '" + tz + "' > /storage/.cache/system_timezone; "
+        "systemctl restart tz-data.service >/dev/null 2>&1; "
+        "timedatectl set-timezone '" + tz + "' >/dev/null 2>&1";
+    run_cmd(c.c_str());
+    tzset();
+}
+
+static void clock_set_ntp(bool on)
+{
+    run_cmd(on ? "timedatectl set-ntp true >/dev/null 2>&1"
+               : "timedatectl set-ntp false >/dev/null 2>&1");
+    g_ntp_on = on;
+}
+
+static void clock_apply_manual()
+{
+    char c[192];
+    snprintf(c, sizeof c,
+             "date -s '%04d-%02d-%02d %02d:%02d:00' >/dev/null 2>&1 && "
+             "hwclock -w >/dev/null 2>&1",
+             g_man_y, g_man_mo, g_man_d, g_man_h, g_man_mi);
+    run_cmd(c);
+}
+
+// D-pad-friendly +/- stepper (hold-to-repeat), no text entry.
+static void clock_spin(const char *label, int *v, int lo, int hi)
+{
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(90.0f);
+    ImGui::PushButtonRepeat(true);
+    if (ImGui::Button(" - ") && *v > lo)
+        (*v)--;
+    ImGui::SameLine();
+    ImGui::Text("%4d", *v);
+    ImGui::SameLine();
+    if (ImGui::Button(" + ") && *v < hi)
+        (*v)++;
+    ImGui::PopButtonRepeat();
+    ImGui::PopID();
+}
+
+static void clock_section()
+{
+    if (!g_clock_loaded)
+        clock_load();
+
+    ImGui::SeparatorText("Clock");
+
+    time_t now = time(nullptr);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    char ts[64];
+    strftime(ts, sizeof ts, "%a %Y-%m-%d   %H:%M:%S   %Z", &lt);
+    ImGui::TextUnformatted(ts);
+
+    if (ImGui::Checkbox("Automatic (NTP)", &g_ntp_on))
+        clock_set_ntp(g_ntp_on);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(sync from network)");
+
+    ImGui::TextUnformatted("Time zone");
+    float w = ImGui::GetContentRegionAvail().x;
+    ImGui::SetNextItemWidth(w * 0.5f - 4.0f);
+    if (!g_tz.empty() && ImGui::BeginCombo("##tzregion", g_tz[g_tz_region].name.c_str())) {
+        for (int i = 0; i < (int)g_tz.size(); i++)
+            if (ImGui::Selectable(g_tz[i].name.c_str(), i == g_tz_region) && i != g_tz_region) {
+                g_tz_region = i;
+                g_tz_city = 0;
+                clock_apply_tz();
+            }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(w * 0.5f - 4.0f);
+    if (!g_tz.empty() && !g_tz[g_tz_region].cities.empty() &&
+        ImGui::BeginCombo("##tzcity", g_tz[g_tz_region].cities[g_tz_city].c_str())) {
+        auto &cities = g_tz[g_tz_region].cities;
+        for (int i = 0; i < (int)cities.size(); i++)
+            if (ImGui::Selectable(cities[i].c_str(), i == g_tz_city) && i != g_tz_city) {
+                g_tz_city = i;
+                clock_apply_tz();
+            }
+        ImGui::EndCombo();
+    }
+    ImGui::TextDisabled("Frontend clock updates after reboot.");
+
+    if (g_ntp_on) {
+        clock_seed_manual();   // track current time so fields are ready when NTP is disabled
+        ImGui::TextDisabled("Turn off Automatic (NTP) to set date/time by hand.");
+    } else {
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Set date & time (local)");
+        clock_spin("Year",   &g_man_y,  1970, 2099);
+        clock_spin("Month",  &g_man_mo, 1, 12);
+        clock_spin("Day",    &g_man_d,  1, 31);
+        clock_spin("Hour",   &g_man_h,  0, 23);
+        clock_spin("Minute", &g_man_mi, 0, 59);
+        if (ImGui::Button("Apply time"))
+            clock_apply_manual();
+        ImGui::SameLine();
+        ImGui::TextDisabled("(writes system clock + RTC)");
+    }
+}
+
 static void tab_system()
 {
     char buf[128];
@@ -2080,6 +2273,9 @@ static void tab_system()
         ImGui::EndCombo();
     }
     ImGui::TextDisabled("Applies on next reboot.");
+
+    // ---- clock / timezone ----
+    clock_section();
 
     // ---- device ----
     ImGui::SeparatorText("Device");
