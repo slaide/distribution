@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Patrick Hennig <patrick.hennig@uu.se>
+Date: Sat, 11 Jul 2026 12:00:00 +0000
+Subject: [PATCH] arm64: dts: qcom: pmk8550: wire RTC set-time via SDAM nvmem
+ offset
+
+The pmk8550 RTC counter is write-protected, so rtc-pm8xxx persists a
+settable wall-clock time by storing a signed offset in a PMIC SDAM nvmem
+cell. With no "offset" cell wired to the RTC node,
+pm8xxx_rtc_update_offset() returns -ENODEV and every RTC_SET_TIME fails;
+the clock is read-only and stays at its power-on epoch (1970) across
+boots, so systohc/NTP can never persist time. This breaks anything that
+relies on monotonic wall-clock across reboots (e.g. Steam Cloud save
+conflict resolution).
+
+Add an rtc_offset cell in pmk8550_sdam_2 (spare scratch at 0xbc, clear of
+reboot_reason@48) and reference it from pmk8550_rtc, matching the wiring
+pmk8280-based boards use. The SDAM lives in the PMIC always-on domain
+(battery-backed), so the offset — and thus wall-clock time — now
+persists across reboots.
+
+Signed-off-by: Patrick Hennig <patrick.hennig@uu.se>
+---
+ arch/arm64/boot/dts/qcom/pmk8550.dtsi | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/pmk8550.dtsi b/arch/arm64/boot/dts/qcom/pmk8550.dtsi
+--- a/arch/arm64/boot/dts/qcom/pmk8550.dtsi
++++ b/arch/arm64/boot/dts/qcom/pmk8550.dtsi
+@@ -49,6 +49,8 @@
+ 			reg = <0x6100>, <0x6200>;
+ 			reg-names = "rtc", "alarm";
+ 			interrupts = <0x0 0x62 0x1 IRQ_TYPE_EDGE_RISING>;
++			nvmem-cells = <&rtc_offset>;
++			nvmem-cell-names = "offset";
+ 		};
+ 
+ 		pmk8550_sdam_2: nvram@7100 {
+@@ -62,6 +64,10 @@
+ 				reg = <0x48 0x1>;
+ 				bits = <1 7>;
+ 			};
++
++			rtc_offset: rtc-offset@bc {
++				reg = <0xbc 0x4>;
++			};
+ 		};
+ 
+ 		pmk8550_gpios: gpio@b800 {
