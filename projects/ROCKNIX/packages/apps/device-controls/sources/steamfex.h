@@ -89,11 +89,16 @@ static const char *SMC_VALUES[] = { "", "none", "mtrack", "full" };
 // eviction churn. WINEESYNC/WINEFSYNC are NOT inert here: proton-cachyos is
 // wine-tkg based, where sync is opt-in via these env vars (unlike Valve
 // Proton) — without them sync falls back to wineserver and sync-heavy games
-// hang or black-screen at launch.
+// hang or black-screen at launch. PROTON_ENABLE_WAYLAND makes proton-cachyos
+// drive its native Wayland backend (winewayland.drv) and present straight to
+// our gamescope compositor instead of routing every frame and input through
+// XWayland; drop it per-game (PROTON_ENABLE_WAYLAND=0 in the override) for the
+// occasional title that misrenders or loses input on winewayland.
 static const char *RECOMMENDED_ENV =
     "MESA_VK_WSI_PRESENT_MODE=mailbox "
     "MESA_SHADER_CACHE_DISABLE=false mesa_glthread=true "
-    "WINEESYNC=1 WINEFSYNC=1";
+    "WINEESYNC=1 WINEFSYNC=1 "
+    "PROTON_ENABLE_WAYLAND=1";
 
 struct Tune {
     int tri[N_FEX_BOOLS];
