@@ -128,11 +128,64 @@ steam_return_to_frontend() {
   esac
 }
 
+# --- external display (system.external_display) ---------------------------
+# Echo the DRM connector name (e.g. DP-1) of the first connector matching one of
+# the given type prefixes. Built-in panels (DSI/eDP/LVDS) are returned as-is;
+# external types (DP/HDMI-A/DisplayPort) only when the connector is connected.
+steam_drm_connector() {
+  local t d name
+  for t in "$@"; do
+    for d in /sys/class/drm/card*-"${t}"-*; do
+      [ -d "$d" ] || continue
+      name="${d##*/}"; name="${name#card*-}"
+      case "$t" in
+        DSI|eDP|LVDS) echo "$name"; return 0 ;;
+        *) [ "$(cat "$d/status" 2>/dev/null)" = "connected" ] && { echo "$name"; return 0; } ;;
+      esac
+    done
+  done
+}
+
+# Preferred (first-listed) mode of a connected external connector, e.g. 1920x1080.
+steam_drm_ext_mode() {
+  local f m
+  for f in /sys/class/drm/card*-DP-*/modes /sys/class/drm/card*-HDMI-A-*/modes; do
+    [ -f "$f" ] || continue
+    m=$(head -1 "$f" 2>/dev/null)
+    [ -n "$m" ] && { echo "$m"; return 0; }
+  done
+}
+
+# When an external display is attached, honor system.external_display for the
+# gamescope session: point --prefer-output at the external (default) or pin it
+# to the built-in panel ("ignore"). With nothing attached this is a no-op, so
+# internal-only and internal-dual-screen devices are unaffected.
+steam_external_display_prefer() {
+  local external internal pref mode
+  external=$(steam_drm_connector DP HDMI-A DisplayPort)
+  [ -n "${external}" ] || return 0
+
+  pref=$(get_setting system.external_display)
+  [ -n "${pref}" ] || pref="external"
+  internal=$(steam_drm_connector DSI eDP LVDS)
+
+  if [ "${pref}" = "external" ]; then
+    PREFER_OUTPUT="--prefer-output ${external}${internal:+,${internal}}"
+    STEAM_EXTERNAL_ACTIVE=1
+    mode=$(steam_drm_ext_mode)
+    [ -n "${mode}" ] && { EXT_W="${mode%x*}"; EXT_H="${mode#*x}"; }
+  elif [ -n "${internal}" ]; then
+    PREFER_OUTPUT="--prefer-output ${internal}"
+    STEAM_EXTERNAL_ACTIVE=0
+  fi
+}
+
 steam_dual_screen_begin() {
   if [ "${DEVICE_HAS_DUAL_SCREEN}" = "true" ]; then
     swaymsg 'seat seat1 fallback true'
     PREFER_OUTPUT="--prefer-output $SDL_VIDEO_DISPLAY_PRIORITY"
   fi
+  steam_external_display_prefer
 }
 
 steam_dual_screen_end() {
@@ -160,6 +213,16 @@ steam_launch_bigpicture() {
     force_orientation="normal"
   fi
 
+  # Panel-rotation flags for the built-in (portrait-mounted) display. An
+  # external display is already landscape, so drop the rotation and adopt the
+  # display's own geometry instead of the panel's.
+  local rotation_args="--force-orientation ${force_orientation} --use-rotation-shader"
+  if [ "${STEAM_EXTERNAL_ACTIVE:-0}" = "1" ]; then
+    W="${EXT_W:-1920}"
+    H="${EXT_H:-1080}"
+    rotation_args=""
+  fi
+
   if [[ "$1" == *.desktop && -f "$1" && "$(basename "$1")" != "Steam.desktop" ]]; then
     local exec_line
     exec_line=$(grep -m1 '^Exec=' "$1" | cut -d'=' -f2-)
@@ -182,7 +245,7 @@ steam_launch_bigpicture() {
       # mode but paces vsynced clients at -r, so a mismatched -r (e.g. sway's
       # 60Hz on a 144Hz panel) beats against real vblanks and drops frames.
       GAMESCOPE_MODE_SAVE_FILE="${gamescope_mode_file}" GAMESCOPE_FAKE_OUTPUT_MM=508x286 env -u WAYLAND_DISPLAY LD_LIBRARY_PATH=/storage/.local/share/Steam/lib/aarch64-linux-gnu/ ${EMUPERF} \
-        gamescope $PREFER_OUTPUT -W "$W" -H "$H" --xwayland-count 2 --mangoapp --backend drm --force-orientation "${force_orientation}" --use-rotation-shader -e -- \
+        gamescope $PREFER_OUTPUT -W "$W" -H "$H" --xwayland-count 2 --mangoapp --backend drm ${rotation_args} -e -- \
         /storage/.local/share/Steam/steamrtarm64/steam -steamdeck -steamos3 -gamepadui -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders ${game_uri:+"$game_uri"}
       steam_return_to_frontend
       exit 0
@@ -195,7 +258,7 @@ steam_launch_bigpicture() {
     else
       systemctl stop sway
       GAMESCOPE_MODE_SAVE_FILE="${gamescope_mode_file}" GAMESCOPE_FAKE_OUTPUT_MM=508x286 env -u WAYLAND_DISPLAY ${EMUPERF} \
-        gamescope $PREFER_OUTPUT -W "$W" -H "$H" --xwayland-count 2 --mangoapp --backend drm --force-orientation "${force_orientation}" --use-rotation-shader -e -- \
+        gamescope $PREFER_OUTPUT -W "$W" -H "$H" --xwayland-count 2 --mangoapp --backend drm ${rotation_args} -e -- \
         FEX /usr/bin/steam -steamdeck -steamos3 -gamepadui -noverifyfiles -nobootstrapupdate -skipinitialbootstrap -norepairfiles -noshaders ${game_uri:+"$game_uri"}
       steam_return_to_frontend
       exit 0
