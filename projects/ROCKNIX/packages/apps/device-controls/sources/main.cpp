@@ -1397,14 +1397,99 @@ static void storage_bar(const char *label, const char *mp)
 
 // ---------- Display ----------
 
+// ---------- external display preference ----------
+// How the system reacts to a plugged-in HDMI / USB-C DisplayPort output. The
+// preference is stored in system.external_display and *enforced* elsewhere:
+// output_monitor drives the sway/EmulationStation desktop, and start_steam.sh
+// picks gamescope's --prefer-output for the Steam session. This section is the
+// shared UI, drawn by both the full app's Display tab and the in-game sidebar.
+static const char *EXTDISP_MODES[]  = { "external", "ignore" };
+static const char *EXTDISP_LABELS[] = { "Show on external display",
+                                        "Ignore (keep internal screen)" };
+enum { EXTDISP_N = 2 };
+
+int extdisp_get()
+{
+    std::string out = run_cmd(". /etc/profile 2>/dev/null; "
+                              "get_setting system.external_display 2>/dev/null");
+    for (int i = 0; i < EXTDISP_N; i++)
+        if (!strncmp(out.c_str(), EXTDISP_MODES[i], strlen(EXTDISP_MODES[i])))
+            return i;
+    return 0;   // unset default == external (preserves the prior auto-switch)
+}
+
+void extdisp_set(int idx)
+{
+    if (idx < 0 || idx >= EXTDISP_N) return;
+    char cmd[256];
+    // Persist, then nudge output_monitor to re-route now (backgrounded so the
+    // HDMI-audio retry loop can't stall the UI; a no-op when sway is down, e.g.
+    // under gamescope, where the change lands on the next Steam launch instead).
+    snprintf(cmd, sizeof cmd,
+             ". /etc/profile 2>/dev/null; "
+             "set_setting system.external_display %s; "
+             "/usr/bin/output_monitor apply >/dev/null 2>&1 &",
+             EXTDISP_MODES[idx]);
+    run_cmd(cmd);
+}
+
+// Whether an external (DP/HDMI) connector currently reads "connected".
+// Throttled to ~1 Hz so drawing it every frame doesn't spawn a popen per frame.
+bool extdisp_connected()
+{
+    static bool cached = false;
+    static time_t last = 0;
+    time_t now = time(nullptr);
+    if (now - last >= 1) {
+        std::string out = run_cmd(
+            "grep -qx connected /sys/class/drm/card*-DP-*/status "
+            "/sys/class/drm/card*-HDMI-A-*/status "
+            "/sys/class/drm/card*-DisplayPort-*/status 2>/dev/null && echo yes");
+        cached = out.rfind("yes", 0) == 0;
+        last = now;
+    }
+    return cached;
+}
+
+void external_display_section()
+{
+    static int mode = -1;
+    if (mode < 0) mode = extdisp_get();
+    ImGui::TextUnformatted("External display");
+    ImGui::SameLine();
+    if (extdisp_connected())
+        ImGui::TextColored(C_ACCENT, "(connected)");
+    else
+        ImGui::TextDisabled("(none connected)");
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::BeginCombo("##extdisp", EXTDISP_LABELS[mode])) {
+        for (int i = 0; i < EXTDISP_N; i++)
+            if (ImGui::Selectable(EXTDISP_LABELS[i], i == mode)) {
+                mode = i;
+                extdisp_set(i);
+            }
+        ImGui::EndCombo();
+    }
+}
+
 static void tab_display()
 {
+    external_display_section();
+    ImGui::Separator();
+
     struct DMode { std::string res, exact, label; };
     static std::string out_name, phys, res, cur_refresh, status;
     static std::vector<DMode> modes;
-    static bool inited = false;
+    static time_t last_read = 0;
+    static bool force = true;   // read on first draw and after a change
 
-    if (!inited) {
+    // Auto-refresh: re-read on a throttle so display hotplug / mode changes
+    // show up on their own. wlr-randr only runs while this tab is visible, so
+    // a ~2 s cadence is cheap.
+    time_t now = time(nullptr);
+    if (force || now - last_read >= 2) {
+        force = false;
+        last_read = now;
         out_name.clear(); phys.clear(); res.clear(); cur_refresh.clear();
         modes.clear();
         try {
@@ -1427,22 +1512,43 @@ static void tab_display()
                 }
                 auto ml = o->find("modes");
                 if (ml != o->end()) {
+                    /* Pass 1: pick the active resolution (the "current" mode's,
+                     * else the first/preferred mode's). A multi-mode external
+                     * display reports rates for several resolutions; we only
+                     * offer the ones for the resolution actually in use. */
                     for (const auto &m : *ml) {
-                        int w = m.value("width", 0), h = m.value("height", 0);
+                        char rmode[24], label[16];
+                        snprintf(rmode, sizeof rmode, "%dx%d",
+                                 m.value("width", 0), m.value("height", 0));
+                        snprintf(label, sizeof label, "%.0f", m.value("refresh", 0.0));
+                        if (m.value("current", false)) {
+                            res = rmode;
+                            cur_refresh = label;
+                        }
+                    }
+                    if (res.empty() && !ml->empty()) {
+                        const auto &m0 = ml->front();
+                        char rmode[24];
+                        snprintf(rmode, sizeof rmode, "%dx%d",
+                                 m0.value("width", 0), m0.value("height", 0));
+                        res = rmode;
+                    }
+                    /* Pass 2: refresh rates for the active resolution only,
+                     * deduplicated by rounded rate (e.g. 59.94 and 60.00 -> one
+                     * "60" button). */
+                    for (const auto &m : *ml) {
+                        char rmode[24];
+                        snprintf(rmode, sizeof rmode, "%dx%d",
+                                 m.value("width", 0), m.value("height", 0));
+                        if (res != rmode)
+                            continue;
                         double r = m.value("refresh", 0.0);
-                        char rmode[24], exact[24], label[16];
-                        snprintf(rmode, sizeof rmode, "%dx%d", w, h);
+                        char exact[24], label[16];
                         snprintf(exact, sizeof exact, "%.6f", r);  // verbatim for --mode
                         snprintf(label, sizeof label, "%.0f", r);  // rounded for the button
-                        if (m.value("current", false)) {
-                            cur_refresh = label;
-                            res = rmode;
-                        } else if (res.empty()) {
-                            res = rmode;
-                        }
                         bool dup = false;
                         for (const auto &dm : modes)
-                            if (dm.res == rmode && dm.label == label)
+                            if (dm.label == label)
                                 dup = true;
                         if (!dup)
                             modes.push_back({ rmode, exact, label });
@@ -1452,14 +1558,11 @@ static void tab_display()
         } catch (const std::exception &) {
             /* malformed/empty wlr-randr output -> "no output" message below */
         }
-        inited = true;
     }
 
     if (out_name.empty()) {
         ImGui::TextWrapped("No display output reported (wlr-randr unavailable).");
-        if (ImGui::Button("Refresh"))
-            inited = false;
-        return;
+        return;   // auto-retried every ~2 s
     }
 
     ImGui::Text("Output:        %s", out_name.c_str());
@@ -1492,7 +1595,7 @@ static void tab_display()
                      "wlr-randr --output %s --mode %s@%sHz 2>&1",
                      out_name.c_str(), modes[i].res.c_str(), modes[i].exact.c_str());
             status = run_cmd(cmd);
-            inited = false;   // re-read current
+            force = true;   // re-read current now
         }
         if (active)
             ImGui::PopStyleColor(3);
@@ -1503,9 +1606,6 @@ static void tab_display()
         ImGui::Spacing();
         ImGui::TextWrapped("%s", status.c_str());
     }
-    ImGui::Separator();
-    if (ImGui::Button("Refresh info"))
-        inited = false;
 }
 
 // ---------- power profiles ----------

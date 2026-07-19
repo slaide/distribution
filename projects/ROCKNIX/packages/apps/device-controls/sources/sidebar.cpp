@@ -327,6 +327,7 @@ void tab_fan();
 void tab_rgb();
 void tab_power();
 void tab_steam();   // Steam per-game FEX tuning (editable live, in-game)
+void external_display_section();   // external-display preference (main.cpp)
 
 static void draw_quick()
 {
@@ -345,6 +346,10 @@ static void draw_quick()
         if (ImGui::SliderInt("##bri", &bright, 5, 100, "%d%%"))
             set_brightness_pct(bright);
     }
+    // Display output handling — the same control as the app's Display tab,
+    // shown unconditionally (its own status line notes whether one is attached).
+    ImGui::Spacing();
+    external_display_section();
 }
 
 static void draw_ui(int uw, int uh)
