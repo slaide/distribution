@@ -16,18 +16,49 @@
 # Exit if this device has no external display connectors at all
 ls /sys/class/drm/card*-DP-* /sys/class/drm/card*-HDMI-A-* 2>/dev/null | grep -q . || exit 0
 
-_LAST_STATE="init"
+_LAST_SIG="init"
 
-_get_active_externals() {
-    wlr-randr 2>/dev/null | awk '
-        /^(DP|HDMI|DisplayPort)-/ { name=$1; in_ext=1; next }
-        /^[A-Za-z]/ { in_ext=0 }
-        in_ext && /Enabled: yes/ { print name }
-    '
+# User preference for a plugged-in external display, written by device-controls
+# (system.external_display). Defaults to "external" — the historical auto-switch.
+_ext_pref() {
+    local p
+    p=$(get_setting system.external_display 2>/dev/null)
+    [ -n "$p" ] && echo "$p" || echo "external"
+}
+
+# Physical connection state from DRM sysfs. Unlike wlr-randr's "Enabled: yes",
+# this stays true for an attached-but-blanked ("ignore") display, so we keep
+# tracking a connector we deliberately turned off.
+_ext_connected() {
+    local s
+    for s in /sys/class/drm/card*-DP-*/status \
+             /sys/class/drm/card*-HDMI-A-*/status \
+             /sys/class/drm/card*-DisplayPort-*/status; do
+        [ -f "$s" ] || continue
+        [ "$(cat "$s")" = "connected" ] && return 0
+    done
+    return 1
+}
+
+# Every external output name sway knows about (enabled or not) — used both to
+# enable one in "external" mode and to blank them all in "ignore" mode.
+_get_all_externals() {
+    wlr-randr 2>/dev/null | awk '/^(DP|HDMI|DisplayPort)-/ { print $1 }'
 }
 
 _get_all_internals() {
     wlr-randr 2>/dev/null | awk '/^(DSI|eDP|LVDS)-/ { print $1 }'
+}
+
+# Built-in panels that are currently powered off. Re-enabling only these (rather
+# than every internal) avoids forcing '--preferred' onto an already-on panel,
+# which would clobber a custom refresh rate set from the Display tab.
+_get_disabled_internals() {
+    wlr-randr 2>/dev/null | awk '
+        /^(DSI|eDP|LVDS)-/ { name=$1; internal=1; next }
+        /^[A-Za-z]/ { internal=0 }
+        internal && /Enabled: no/ { print name }
+    '
 }
 
 _wp_audio_card() {
@@ -61,39 +92,79 @@ _switch_audio() {
     [ -n "$card" ] && [ -n "$target" ] && wpctl set-profile "$card" "$target" 2>/dev/null || true
 }
 
+# Route displays according to (physical connection x user preference). The
+# decision is captured in a signature so idempotent re-checks (every sway event
+# and the 10s timeout) do nothing unless something actually changed. Pass
+# "force" to re-apply unconditionally, e.g. right after the preference changes.
 _apply() {
-    local state="internal"
-    [ -n "$(_get_active_externals)" ] && state="external"
-    [ "$_LAST_STATE" = "$state" ] && return
-    local prev="$_LAST_STATE"
-    _LAST_STATE="$state"
+    local force="$1"
+    local connected pref ext_out state prev_state sig out
 
-    if [ "$state" = "external" ]; then
-        local ext_out
-        ext_out=$(_get_active_externals | head -1)
-        while IFS= read -r out; do
-            wlr-randr --output "$out" --off 2>/dev/null
-        done < <(_get_all_internals)
-        if [ -n "$ext_out" ]; then
-            wlr-randr --output "$ext_out" --mode 1920x1080@60 2>/dev/null \
-                || wlr-randr --output "$ext_out" --mode 1920x1080 2>/dev/null || true
-            swaymsg "[app_id=\"emulationstation\"] move output ${ext_out}" 2>/dev/null || true
-        fi
-        # Stop USB gadget: its data lanes conflict with DP Alt Mode on RK3576
-        systemctl is-active --quiet usbgadget && systemctl stop usbgadget
-        _switch_audio external
+    if _ext_connected; then connected="yes"; else connected="no"; fi
+    pref=$(_ext_pref)
+    ext_out=$(_get_all_externals | head -1)
+
+    if [ "$connected" = "yes" ] && [ "$pref" = "external" ] && [ -n "$ext_out" ]; then
+        state="external"
     else
-        # Only re-enable internal panels on actual disconnect, not first-boot
-        if [ "$prev" != "init" ]; then
-            while IFS= read -r out; do
-                wlr-randr --output "$out" --preferred --on 2>/dev/null
-            done < <(_get_all_internals)
-            _switch_audio internal
-        fi
+        state="internal"
     fi
 
+    sig="${state}:${connected}:${pref}"
+    [ "$force" != "force" ] && [ "$_LAST_SIG" = "$sig" ] && return
+    prev_state="${_LAST_SIG%%:*}"
+    _LAST_SIG="$sig"
 
+    if [ "$state" = "external" ]; then
+        # Enable the external output FIRST, while the internal panel is still on.
+        # --on is required: an output left disabled by a previous "ignore"
+        # session (blanked with --off) is not revived by --mode alone.
+        wlr-randr --output "$ext_out" --on --mode 1920x1080@60 2>/dev/null \
+            || wlr-randr --output "$ext_out" --on --mode 1920x1080 2>/dev/null \
+            || wlr-randr --output "$ext_out" --on 2>/dev/null || true
+        # Move the frontend onto the external output while the internal is still
+        # live, THEN blank the internal. Order matters: a fullscreen GL/SDL client
+        # (konkr-launcher) whose surface is momentarily left with *no* enabled
+        # output wedges and never repaints -> permanent black on the external
+        # (no compositor-side nudge recovers it). Migrating output->output with the
+        # internal still up avoids that zero-output gap. `move workspace` covers
+        # any frontend; the app_id moves are belt-and-suspenders for known ones.
+        swaymsg "move workspace to output ${ext_out}" 2>/dev/null || true
+        swaymsg "[app_id=\"emulationstation\"] move output ${ext_out}" 2>/dev/null || true
+        swaymsg "[app_id=\"konkr-launcher\"] move output ${ext_out}" 2>/dev/null || true
+        while IFS= read -r out; do
+            [ -n "$out" ] && wlr-randr --output "$out" --off 2>/dev/null
+        done < <(_get_all_internals)
+        # Stop USB gadget: its data lanes conflict with DP Alt Mode.
+        systemctl is-active --quiet usbgadget && systemctl stop usbgadget
+        # Audio can take seconds (wireplumber re-probe for the HDMI sink);
+        # background it so the display switch isn't blocked behind it.
+        _switch_audio external >/dev/null 2>&1 &
+    else
+        # Built-in panel path. Re-enable internals when returning from an
+        # external session (not on first boot, unless forced by a pref change).
+        if [ "$prev_state" != "init" ] || [ "$force" = "force" ]; then
+            while IFS= read -r out; do
+                [ -n "$out" ] && wlr-randr --output "$out" --preferred --on 2>/dev/null
+            done < <(_get_disabled_internals)
+            _switch_audio internal >/dev/null 2>&1 &
+        fi
+        # "Ignore": a display is attached but the user wants it dark — blank
+        # every external output so it shows nothing.
+        if [ "$connected" = "yes" ]; then
+            while IFS= read -r out; do
+                [ -n "$out" ] && wlr-randr --output "$out" --off 2>/dev/null
+            done < <(_get_all_externals)
+        fi
+    fi
 }
+
+# One-shot re-apply, invoked by device-controls when the preference changes at
+# runtime so the switch takes effect immediately instead of on the next hotplug.
+if [ "$1" = "apply" ]; then
+    _apply force
+    exit 0
+fi
 
 # Allow sway to finish initialising outputs before first check
 sleep 3
