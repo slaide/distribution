@@ -19,7 +19,7 @@ new file mode 100644
 index 0000000..f32d52dcf
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/sm8750-konkr-pf-elite.dts
-@@ -0,0 +1,1639 @@
+@@ -0,0 +1,1642 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * KONKR Pocket FIT Elite (Snapdragon 8 Elite / SM8750) — ROCKNIX board DTS
@@ -1394,6 +1394,9 @@ index 0000000..f32d52dcf
 +};
 +
 +&usb_dp_qmpphy {
++	vdda-phy-supply = <&vreg_l3g_1p2>;
++	vdda-pll-supply = <&vreg_l2d_0p88>;
++
 +	status = "okay";
 +};
 +
