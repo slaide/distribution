@@ -1422,14 +1422,19 @@ int extdisp_get()
 void extdisp_set(int idx)
 {
     if (idx < 0 || idx >= EXTDISP_N) return;
-    char cmd[256];
-    // Persist, then nudge output_monitor to re-route now (backgrounded so the
-    // HDMI-audio retry loop can't stall the UI; a no-op when sway is down, e.g.
-    // under gamescope, where the change lands on the next Steam launch instead).
+    char cmd[512];
+    // Persist, then apply. Under sway, output_monitor re-routes live. Under the
+    // persistent gamescope session gamescope's --prefer-output is fixed at start
+    // (no live output-switch; forcing DRM connector status corrupts the EDID),
+    // so re-pick the output by restarting konkr-session -- a brief reload, fine
+    // for a deliberate change. Plug/unplug itself already auto-migrates and does
+    // not need this. Backgrounded so neither path stalls the UI.
     snprintf(cmd, sizeof cmd,
              ". /etc/profile 2>/dev/null; "
              "set_setting system.external_display %s; "
-             "/usr/bin/output_monitor apply >/dev/null 2>&1 &",
+             "{ if [ \"$(get_setting system.compositor)\" = gamescope ]; then "
+                 "systemctl --no-block restart konkr-session.service; "
+               "else /usr/bin/output_monitor apply; fi; } >/dev/null 2>&1 &",
              EXTDISP_MODES[idx]);
     run_cmd(cmd);
 }

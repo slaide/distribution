@@ -27,16 +27,25 @@ chmod 700 "${XDG_RUNTIME_DIR}"
 # preferred (system.external_display). Same policy as the Steam launcher; the
 # fixed logical resolution is native on both the panel (1080x1920 rotated ==
 # 1920x1080 effective) and a 1080p external. ---
-ext=""
+# List EVERY external connector that exists (the /sys node is present even while
+# disconnected) ahead of the internal panel when the user prefers external
+# output. gamescope re-evaluates --prefer-output on hotplug, so with the external
+# already in the list it auto-migrates onto a display the moment it is plugged
+# and falls back to DSI-1 on unplug -- no session restart, no output_monitor.
+# pref=ignore leaves the externals out entirely, so a plugged cable is a no-op
+# (internal only); switching that preference is applied by restarting the session
+# (device-controls does this) since --prefer-output is fixed at gamescope start.
+ext_list=""
 for s in /sys/class/drm/card*-DP-*/status \
          /sys/class/drm/card*-HDMI-A-*/status \
          /sys/class/drm/card*-DisplayPort-*/status; do
-  [ -f "$s" ] && [ "$(cat "$s" 2>/dev/null)" = "connected" ] || continue
-  ext="$(basename "$(dirname "$s")")"; ext="${ext#card*-}"; break
+  [ -f "$s" ] || continue
+  name="$(basename "$(dirname "$s")")"; name="${name#card*-}"
+  ext_list="${ext_list}${name},"
 done
 pref="$(get_setting system.external_display 2>/dev/null)"; [ -n "$pref" ] || pref="external"
-if [ -n "$ext" ] && [ "$pref" = "external" ]; then
-  PREFER_OUTPUT="--prefer-output ${ext},DSI-1"
+if [ "$pref" = "external" ] && [ -n "$ext_list" ]; then
+  PREFER_OUTPUT="--prefer-output ${ext_list}DSI-1"
 else
   PREFER_OUTPUT="--prefer-output DSI-1"
 fi
