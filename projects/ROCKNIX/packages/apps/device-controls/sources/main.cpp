@@ -38,6 +38,7 @@
 #include "imgui_impl_sdlrenderer2.h"
 #include "theme.h"
 #include "steamfex_ui.h"
+#include "wifi_ui.h"
 
 using json = nlohmann::json;
 
@@ -2461,6 +2462,11 @@ static bool draw_footer(float width, float height)
     return quit;
 }
 
+// ---------- wi-fi ----------
+// Non-static: the --sidebar overlay (sidebar.cpp) reuses this exactly like the
+// other tab_*() entry points. All state lives in wifi_ui.h.
+void tab_wifi() { wifiui::draw(); }
+
 // ---------- main ----------
 
 int run_sidebar();   // sidebar.cpp — Wayland layer-shell quick-settings overlay
@@ -2594,6 +2600,8 @@ int main(int argc, char **argv)
             static const bool has_imu = !find_iio_imu().empty();
             static const bool has_fan = !find_pwm().empty();
             static const bool has_steam = access(steamfex::STEAM_ROOT, F_OK) == 0;
+            static const bool has_wifi = !run_cmd(
+                "ls /sys/class/net 2>/dev/null | grep -m1 ^wlan").empty();
 
             if (ImGui::BeginTabItem("Gamepad")) {
                 tab_gamepad(gc);
@@ -2621,6 +2629,10 @@ int main(int argc, char **argv)
             }
             if (ImGui::BeginTabItem("Power")) {
                 tab_power();
+                ImGui::EndTabItem();
+            }
+            if (has_wifi && ImGui::BeginTabItem("Wi-Fi")) {
+                tab_wifi();
                 ImGui::EndTabItem();
             }
             if (has_steam && ImGui::BeginTabItem("Steam")) {

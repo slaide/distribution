@@ -33,7 +33,7 @@ make_target() {
 
   # The sidebar uses the GLES2 ImGui backend; the define must apply to both the
   # backend .cpp and our include of its header.
-  ${CXX} ${CXXFLAGS} ${LDFLAGS} -std=c++17 -DIMGUI_IMPL_OPENGL_ES2 \
+  ${CXX} ${CXXFLAGS} ${LDFLAGS} -std=c++17 -pthread -DIMGUI_IMPL_OPENGL_ES2 \
     -I${PKG_BUILD} -I${PKG_BUILD}/backends \
     -I${SYSROOT_PREFIX}/usr/include/SDL2 -D_REENTRANT \
     ${PKG_DIR}/sources/main.cpp \

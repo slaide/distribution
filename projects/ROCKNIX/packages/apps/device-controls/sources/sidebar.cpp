@@ -327,6 +327,7 @@ void tab_fan();
 void tab_rgb();
 void tab_power();
 void tab_steam();   // Steam per-game FEX tuning (editable live, in-game)
+void tab_wifi();    // Wi-Fi network picker + on-screen keyboard (wifi_ui.h)
 void external_display_section();   // external-display preference (main.cpp)
 
 static void draw_quick()
@@ -383,7 +384,7 @@ static void draw_ui(int uw, int uh)
     ImGui::Separator();
     ImGui::Spacing();
 
-    static const char *names[] = { "Quick", "Power", "Steam", "Buttons", "Fan", "RGB" };
+    static const char *names[] = { "Quick", "Wi-Fi", "Power", "Steam", "Buttons", "Fan", "RGB" };
     static int tab = 0;
     static bool enter_content = false;   // tab bar -> content, handed this frame
     static bool enter_tabbar = false;    // content -> tab bar, handed next frame
@@ -427,11 +428,12 @@ static void draw_ui(int uw, int uh)
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 14));
     switch (tab) {
     case 0: draw_quick();  break;
-    case 1: tab_power();   break;
-    case 2: tab_steam();   break;
-    case 3: tab_buttons(); break;
-    case 4: tab_fan();     break;
-    case 5: tab_rgb();     break;
+    case 1: tab_wifi();    break;
+    case 2: tab_power();   break;
+    case 3: tab_steam();   break;
+    case 4: tab_buttons(); break;
+    case 5: tab_fan();     break;
+    case 6: tab_rgb();     break;
     }
     ImGui::PopStyleVar();
     ImGui::EndChild();
