@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# systemd system-sleep hook: stay on the SAME Wi-Fi network across suspend/resume
+# (and prefer it at boot). The reconnect itself is NetworkManager's autoconnect
+# (ROCKNIX only rfkill-unblocks the radio on resume); with several saved profiles
+# NM could otherwise auto-join a DIFFERENT access point than the one in use --
+# often on another subnet, silently moving networks and dropping any session.
+#
+# Fix: on the way DOWN, pin NM autoconnect to the active network -- raise its
+# priority and turn autoconnect OFF on every other Wi-Fi profile -- so once the
+# radio comes back up NM can only rejoin that one. This persists in the NM
+# profiles, so it also fixes the wrong-network-at-boot case. We deliberately do
+# NOT force a reconnect on resume: this hook runs before ROCKNIX's `sleep` hook
+# rfkill-unblocks the radio, so an nmcli connect here hits a blocked device,
+# spawns a bogus duplicate profile and leaves NM "strictly unmanaged" for ~20s.
+#   $1 = pre|post   $2 = suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+#
+# systemd-sleep runs hooks with a minimal environment; set PATH explicitly (else
+# nmcli/awk are not found and the hook silently no-ops).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:${PATH}
+export PATH
+
+STATE=/run/konkr-wifi-active-ssid
+log() { logger -t konkr-wifi-resume "$*" 2>/dev/null; }
+
+case "$1" in
+    pre)
+        wlan=$(ls /sys/class/net 2>/dev/null | grep -m1 '^wlan')
+        [ -n "$wlan" ] || exit 0
+        # active connection name == the SSID's NM profile (no scan cache needed,
+        # unlike `dev wifi`, so this is reliable during the suspend sequence)
+        ssid=$(nmcli -t -f GENERAL.CONNECTION device show "$wlan" 2>/dev/null | cut -d: -f2-)
+        [ -z "$ssid" ] && [ -f "$STATE" ] && ssid=$(cat "$STATE")   # fall back to cache
+        [ -n "$ssid" ] || { log "pre: no active/known SSID"; exit 0; }
+        printf '%s' "$ssid" > "$STATE"
+        # pin autoconnect to this network, demote the rest
+        nmcli -t -f NAME,TYPE connection show 2>/dev/null \
+            | awk -F: '$2 ~ /wireless/ {print $1}' \
+            | while IFS= read -r n; do
+                if [ "$n" = "$ssid" ]; then
+                    nmcli connection modify "$n" connection.autoconnect yes \
+                        connection.autoconnect-priority 100 2>/dev/null
+                else
+                    nmcli connection modify "$n" connection.autoconnect no 2>/dev/null
+                fi
+            done
+        log "pre: pinned autoconnect to '$ssid'"
+        ;;
+esac
+exit 0

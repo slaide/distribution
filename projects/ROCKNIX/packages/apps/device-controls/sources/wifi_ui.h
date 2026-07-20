@@ -168,6 +168,16 @@ inline void start_connect(const std::string &ssid, const std::string &psk, bool 
                 "timeout 40 wifictl connect " + shq(ssid) + " " + shq(psk) + " >/dev/null 2>&1";
             run(cmd.c_str());
         }
+        // Pin NM autoconnect to this network so resume/boot rejoin IT, not
+        // another saved AP (mirrors the konkr-wifi-resume suspend hook). Demote
+        // every other saved Wi-Fi profile.
+        run(("nmcli -t -f NAME,TYPE connection show 2>/dev/null | "
+             "awk -F: '$2 ~ /wireless/{print $1}' | while IFS= read -r n; do "
+             "if [ \"$n\" = " + shq(ssid) + " ]; then "
+             "nmcli connection modify \"$n\" connection.autoconnect yes "
+             "connection.autoconnect-priority 100 2>/dev/null; "
+             "else nmcli connection modify \"$n\" connection.autoconnect no 2>/dev/null; fi; "
+             "done").c_str());
         std::string cur = active_ssid();
         {
             std::lock_guard<std::mutex> lk(S().mtx);
