@@ -1,0 +1,54 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# Persistent gamescope session compositor for SM8750 (KONKR). One gamescope owns
+# the DRM display for the whole session and hosts the frontend (and, later, Steam
+# and emulators) as its clients -- the Steam Deck "gamescope-session" model. This
+# replaces sway as the session compositor and is selected by
+# system.compositor=gamescope (see the SM8750 090-ui_service quirk); the sway
+# path stays as the fallback.
+#
+# gamescope's fixed virtual output decouples the client from the physical
+# connector, so a display hotplug just re-scans-out (no zero-output gap) and the
+# frontend cannot wedge the way it did being juggled by sway + output_monitor.
+source /etc/profile
+
+export HOME="${HOME:-/storage}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/var/run/0-runtime-dir}"
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+
+# Session dbus (pipewire / portals expect one), mirroring sway.sh.
+[ -S "${XDG_RUNTIME_DIR}/bus" ] || \
+  dbus-daemon --session --address="unix:path=${XDG_RUNTIME_DIR}/bus" &
+
+# --- Output selection: the built-in panel, or an attached external display when
+# preferred (system.external_display). Same policy as the Steam launcher; the
+# fixed logical resolution is native on both the panel (1080x1920 rotated ==
+# 1920x1080 effective) and a 1080p external. ---
+ext=""
+for s in /sys/class/drm/card*-DP-*/status \
+         /sys/class/drm/card*-HDMI-A-*/status \
+         /sys/class/drm/card*-DisplayPort-*/status; do
+  [ -f "$s" ] && [ "$(cat "$s" 2>/dev/null)" = "connected" ] || continue
+  ext="$(basename "$(dirname "$s")")"; ext="${ext#card*-}"; break
+done
+pref="$(get_setting system.external_display 2>/dev/null)"; [ -n "$pref" ] || pref="external"
+if [ -n "$ext" ] && [ "$pref" = "external" ]; then
+  PREFER_OUTPUT="--prefer-output ${ext},DSI-1"
+else
+  PREFER_OUTPUT="--prefer-output DSI-1"
+fi
+
+# The built-in panel is portrait-mounted (KONKR: sway "transform 90" == gamescope
+# "right"). --force-orientation only affects gamescope's *internal* screen type,
+# so it is harmless on the landscape external. --use-rotation-shader: this DPU
+# can't hardware-rotate. --force-composition: it also can't direct-scan-out
+# across an output switch. --force-windows-fullscreen shows a non-Steam client
+# (the launcher) fullscreen without needing Steam's STEAM_GAME atom.
+exec env -u WAYLAND_DISPLAY gamescope \
+  --backend drm --xwayland-count 2 --force-windows-fullscreen \
+  ${PREFER_OUTPUT} -W 1920 -H 1080 \
+  --force-orientation right --use-rotation-shader --force-composition \
+  -- /usr/bin/konkr-session-client

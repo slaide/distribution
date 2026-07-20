@@ -2,21 +2,34 @@
 # SPDX-License-Identifier: GPL-2.0
 # Copyright (C) 2024 ROCKNIX (https://github.com/ROCKNIX)
 
-### Select the boot frontend from the persisted system.frontend setting.
-### The generated snippet resolves it at profile-source time (get_setting is
+### Select the boot compositor + frontend from persisted settings.
+### The generated snippet resolves them at profile-source time (get_setting is
 ### defined by 001-functions, sourced before this 090- file), and autostart
 ### re-sources the profile just before `systemctl start ${UI_SERVICE}`.
 ###
+### system.compositor:
+###   sway (default/unset)  sway owns DRM; the frontend runs as a sway client,
+###                         and the Steam path stops sway + spawns gamescope.
+###   gamescope             one persistent gamescope owns DRM for the whole
+###                         session (Deck-style konkr-session); the frontend
+###                         (and later Steam/emulators) run as its clients.
+###
+### system.frontend (the app, both compositors):
 ###   es              EmulationStation           (default / unset)
 ###   steam           Steam Big Picture session  (drops back to ES on exit)
 ###   konkr-launcher  konkr-launcher grid frontend
 ###
-### sway.service stays in every set: the Steam path reads its display geometry
-### from the live sway (swaymsg) before handing the display to gamescope.
+### sway.service stays in every sway set: the Steam path reads its display
+### geometry from the live sway (swaymsg) before handing the display to gamescope.
 cat <<'EOF' >/storage/.config/profile.d/090-ui_service
-case "$(get_setting system.frontend)" in
-  steam)          UI_SERVICE="sway.service steam-session.service" ;;
-  konkr-launcher) UI_SERVICE="sway.service konkr-launcher.service" ;;
-  *)              UI_SERVICE="sway.service essway.service" ;;
-esac
+if [ "$(get_setting system.compositor)" = "gamescope" ]; then
+  # konkr-session-client picks the frontend app from system.frontend.
+  UI_SERVICE="konkr-session.service"
+else
+  case "$(get_setting system.frontend)" in
+    steam)          UI_SERVICE="sway.service steam-session.service" ;;
+    konkr-launcher) UI_SERVICE="sway.service konkr-launcher.service" ;;
+    *)              UI_SERVICE="sway.service essway.service" ;;
+  esac
+fi
 EOF

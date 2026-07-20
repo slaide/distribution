@@ -1,0 +1,19 @@
+[Unit]
+Description=KONKR persistent gamescope session compositor
+After=multi-user.target rocknix-automount.service konkr-inputd.service
+# Never coexist with sway -- both take DRM master. sway is not enabled (it is
+# started by name via the UI_SERVICE list), so this is a belt-and-suspenders.
+Conflicts=sway.service
+ConditionKernelCommandLine=!installer
+
+[Service]
+Environment=HOME=/storage
+Environment=XDG_RUNTIME_DIR=/var/run/0-runtime-dir
+WorkingDirectory=/storage
+ExecStartPre=-/bin/sh -c 'mkdir -p /var/run/0-runtime-dir && chmod 700 /var/run/0-runtime-dir'
+ExecStart=/usr/bin/konkr-session
+Restart=always
+RestartSec=5
+
+# No [Install]: started by name from the SM8750 090-ui_service quirk (UI_SERVICE),
+# like konkr-launcher.service and steam-session.service.

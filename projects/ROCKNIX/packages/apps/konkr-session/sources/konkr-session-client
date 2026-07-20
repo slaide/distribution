@@ -1,0 +1,33 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# Baselayer client of the persistent gamescope session (konkr-session): launches
+# the selected frontend app as a gamescope Xwayland (X11) client and stays as
+# gamescope's top-level child so gamescope persists for the whole session.
+#
+# The frontend app comes from system.frontend (es / konkr-launcher), orthogonal
+# to system.compositor (which compositor). SDL_VIDEODRIVER=x11 overrides the
+# global wayland default (packages/wayland/compositor/sway/profile.d) so the app
+# attaches to gamescope's Xwayland (:0), exactly like the Steam launcher does.
+source /etc/profile
+
+export SDL_VIDEODRIVER=x11
+unset WAYLAND_DISPLAY
+
+case "$(get_setting system.frontend)" in
+  konkr-launcher)
+    export SDL_VIDEO_X11_WMCLASS="konkr-launcher"
+    exec /usr/bin/konkr-launcher
+    ;;
+  steam)
+    # Boot-straight-to-Steam under the persistent session is Stage 2; until then
+    # fall back to the launcher (from which Steam is reachable).
+    export SDL_VIDEO_X11_WMCLASS="konkr-launcher"
+    exec /usr/bin/konkr-launcher
+    ;;
+  *)
+    export SDL_VIDEO_X11_WMCLASS="emulationstation"
+    exec /usr/bin/emulationstation --log-path /var/log --no-splash
+    ;;
+esac
