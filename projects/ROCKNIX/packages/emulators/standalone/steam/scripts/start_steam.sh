@@ -213,14 +213,29 @@ steam_launch_bigpicture() {
     force_orientation="normal"
   fi
 
-  # Panel-rotation flags for the built-in (portrait-mounted) display. An
-  # external display is already landscape, so drop the rotation and adopt the
-  # display's own geometry instead of the panel's.
+  # Panel-rotation flags. gamescope tracks orientation per screen *type* and
+  # auto-applies each connector's KMS "panel orientation" property: the built-in
+  # panel is portrait-mounted (property "Right Side Up"), external displays are
+  # landscape (no property). The internal-only path also pins --force-orientation
+  # from the focused output's transform.
+  #
+  # For an external session we adopt the display's landscape geometry but STILL
+  # arm the rotation path, so an external unplug lets gamescope re-scan-out onto
+  # the built-in panel and Steam + the running game just migrate (no restart):
+  #   --use-rotation-shader : this DPU can't do hardware plane rotation, so the
+  #       auto-detected panel orientation must be applied in the shader (without
+  #       it gamescope attempts a plane rotation the DPU rejects -- EINVAL
+  #       "failed to prepare 1-layer flip" -- and spins, freezing the device).
+  #   --force-composition   : the DPU also can't direct-scan-out across the
+  #       output switch.
+  # We deliberately do NOT carry --force-orientation here: it is derived from the
+  # focused (external, transform 0 -> "left") output and would wrongly override
+  # the built-in panel's correct auto-detected orientation on the switch.
   local rotation_args="--force-orientation ${force_orientation} --use-rotation-shader"
   if [ "${STEAM_EXTERNAL_ACTIVE:-0}" = "1" ]; then
     W="${EXT_W:-1920}"
     H="${EXT_H:-1080}"
-    rotation_args=""
+    rotation_args="--use-rotation-shader --force-composition"
   fi
 
   if [[ "$1" == *.desktop && -f "$1" && "$(basename "$1")" != "Steam.desktop" ]]; then
