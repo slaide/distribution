@@ -207,9 +207,16 @@ static void launch_rom(const System &s, const std::string &path)
 
 static void launch_steam()
 {
-    // start_steam.sh stops sway, runs gamescope+Steam, and starts essway
-    // (EmulationStation) when Steam exits — so our compositor is gone on
-    // return. Quit cleanly; ES is the frontend from here.
+    // start_steam.sh blocks until Steam exits, then we quit -- in BOTH models.
+    // Legacy sway: start_steam tore down sway and started EmulationStation, so
+    // our compositor is gone and ES is the frontend. Persistent gamescope
+    // session: konkr-session-client runs us in a supervisor loop, so exiting
+    // makes it respawn a FRESH launcher. We must not try to resume in place:
+    // this process sat blocked in system() for the whole Steam session, so
+    // gamescope dropped our (unserviced) Xwayland surface and no longer presents
+    // it -- a resumed frame renders into a dead window (stuck screen). Exiting
+    // and letting the loop relaunch gives a clean new surface. gamescope itself
+    // persists either way (its --child is the loop, not us).
     (void)system("/usr/bin/start_steam.sh");
     g_quit = true;
 }

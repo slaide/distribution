@@ -297,6 +297,36 @@ steam_launch_bigpicture() {
   fi
 }
 
+# Launch Steam Big Picture as a client of the already-running persistent
+# gamescope session (konkr-session owns DRM). Runs on gamescope's Xwayland (:0)
+# and blocks until Steam exits, so the launcher -- the session's baselayer
+# client, blocked in system("start_steam.sh") -- resumes as the foreground
+# window. No sway teardown, no second gamescope, no return-to-frontend restart:
+# the session gamescope already composites, rotates, and handles display hotplug
+# for everything.
+steam_launch_in_session() {
+  local game_uri="" D="${DISPLAY:-:0}"
+  if [[ "$1" == *.desktop && -f "$1" && "$(basename "$1")" != "Steam.desktop" ]]; then
+    local exec_line; exec_line=$(grep -m1 '^Exec=' "$1" | cut -d'=' -f2-)
+    game_uri="${exec_line#steam } -silent"
+  fi
+  local SR=/storage/.local/share/Steam/steamrtarm64/steam
+  local LP=/storage/.local/share/Steam/lib/aarch64-linux-gnu/
+  # The session gamescope launched the launcher (our parent) as its --child, so
+  # our inherited env carries gamescope's Vulkan-WSI enablers. Steam here is a
+  # *secondary* client, NOT gamescope's --child: with those set its WSI hook
+  # can't attach ("CreateSwapchainKHR: non-gamescope swapchain, hooking has
+  # failed somewhere") and its window never composites -- Steam then bails.
+  # Drop them so the Steam client presents through the normal X11 path.
+  unset ENABLE_GAMESCOPE_WSI MESA_LOADER_DRIVER_OVERRIDE vk_xwayland_wait_ready
+  # Bootstrap/update pass (Steam updates itself and exits).
+  SDL_VIDEODRIVER=x11 DISPLAY="$D" LD_LIBRARY_PATH="$LP" ${EMUPERF} "$SR" -steamdeck -exitsteam
+  # Big Picture as the foreground gamescope client (blocks until Steam exits).
+  SDL_VIDEODRIVER=x11 DISPLAY="$D" LD_LIBRARY_PATH="$LP" ${EMUPERF} \
+    "$SR" -steamdeck -steamos3 -gamepadui -noverifyfiles -nobootstrapupdate \
+    -skipinitialbootstrap -norepairfiles -noshaders ${game_uri:+"$game_uri"}
+}
+
 # Entry point from EmulationStation (not used when this file is sourced).
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   source /etc/profile

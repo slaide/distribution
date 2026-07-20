@@ -3,5 +3,25 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
 
-killall gamescope steam FEX
-killall -9 gamescope steam FEX
+# Steam's "Switch to Desktop" / session-exit invokes this. In the persistent
+# gamescope session (system.compositor=gamescope) gamescope is the long-lived
+# session compositor hosting the launcher and Steam as clients -- killing it
+# tears down the whole session (systemd then restarts it, a ~10s black reload).
+# There we exit only Steam + FEX so the launcher client resumes as the
+# foreground window. In the legacy sway model Steam owns its own gamescope,
+# which must be torn down. Use the setting, not $GAMESCOPE_WAYLAND_DISPLAY: the
+# sway path also sets that var (Steam runs inside its own gamescope there).
+. /etc/profile 2>/dev/null
+
+if [ "$(get_setting system.compositor)" = "gamescope" ]; then
+  killall steam FEX 2>/dev/null
+  killall -9 steam FEX 2>/dev/null
+  # Steam's Proton/wine ecosystem (compat-tool checks, games) reparents to
+  # gamescopereaper when steam dies; killall by unix name misses the Windows
+  # .exe processes, which would otherwise linger and lock prefixes. Sweep them
+  # by their Proton/wine cmdline -- no match on the compositor or the launcher.
+  pkill -9 -f 'compatibilitytools\.d/|/proton |\.exe' 2>/dev/null
+else
+  killall gamescope steam FEX
+  killall -9 gamescope steam FEX
+fi

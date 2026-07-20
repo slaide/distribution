@@ -21,6 +21,21 @@ steam_set_cpu_affinity
 steam_debug_print
 
 steam_arm64_binfmt_and_proton_prep
+
+# Persistent gamescope session (konkr-session owns DRM): launch Steam as a
+# client of the running gamescope instead of tearing down sway and spawning a
+# second gamescope. GAMESCOPE_WAYLAND_DISPLAY is set by that gamescope for its
+# children (the launcher system()s this script), so it marks the session path.
+# Skip the sway geometry read, the systemd-scope re-exec (it strips this env),
+# and the dual-screen/return-to-frontend logic.
+if [ -n "${GAMESCOPE_WAYLAND_DISPLAY}" ]; then
+  set_kill set "steam FEX"   # quit-hotkey must NOT kill the session compositor
+  steam_setup_environment
+  steam_launch_in_session "$@"
+  systemctl restart systemd-binfmt
+  exit 0
+fi
+
 steam_read_sway_geometry
 steam_setup_environment
 steam_scope_reexec_if_needed "$@"

@@ -2,32 +2,39 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
 #
-# Baselayer client of the persistent gamescope session (konkr-session): launches
-# the selected frontend app as a gamescope Xwayland (X11) client and stays as
-# gamescope's top-level child so gamescope persists for the whole session.
+# Baselayer client of the persistent gamescope session (konkr-session): keeps the
+# selected frontend alive as a gamescope Xwayland (X11) client for the whole
+# session -- the Steam Deck "gamescope-session" model.
 #
-# The frontend app comes from system.frontend (es / konkr-launcher), orthogonal
-# to system.compositor (which compositor). SDL_VIDEODRIVER=x11 overrides the
-# global wayland default (packages/wayland/compositor/sway/profile.d) so the app
-# attaches to gamescope's Xwayland (:0), exactly like the Steam launcher does.
+# Supervisor loop, NOT a single exec: the frontend may exit (konkr-launcher quits
+# after launching Steam; an app teardown; a crash) but gamescope must persist.
+# gamescope's --child is THIS script, which never exits, so the compositor
+# survives the frontend restarting -- each iteration brings the menu straight
+# back with no teardown. (The legacy sway path relied on killing gamescope to
+# respawn the frontend; here gamescope stays and we just re-run it.)
+#
+# The frontend comes from system.frontend (es / konkr-launcher), orthogonal to
+# system.compositor. SDL_VIDEODRIVER=x11 overrides the global wayland default
+# (packages/wayland/compositor/sway/profile.d) so the app attaches to gamescope's
+# Xwayland (:0), exactly like the Steam launcher does.
 source /etc/profile
 
 export SDL_VIDEODRIVER=x11
 unset WAYLAND_DISPLAY
 
-case "$(get_setting system.frontend)" in
-  konkr-launcher)
-    export SDL_VIDEO_X11_WMCLASS="konkr-launcher"
-    exec /usr/bin/konkr-launcher
-    ;;
-  steam)
-    # Boot-straight-to-Steam under the persistent session is Stage 2; until then
-    # fall back to the launcher (from which Steam is reachable).
-    export SDL_VIDEO_X11_WMCLASS="konkr-launcher"
-    exec /usr/bin/konkr-launcher
-    ;;
-  *)
-    export SDL_VIDEO_X11_WMCLASS="emulationstation"
-    exec /usr/bin/emulationstation --log-path /var/log --no-splash
-    ;;
-esac
+while :; do
+  case "$(get_setting system.frontend)" in
+    konkr-launcher|steam)
+      # Boot-straight-to-Steam under the session is future work; the launcher is
+      # where Steam is reachable, so both settle on it for now.
+      export SDL_VIDEO_X11_WMCLASS="konkr-launcher"
+      /usr/bin/konkr-launcher
+      ;;
+    *)
+      export SDL_VIDEO_X11_WMCLASS="emulationstation"
+      /usr/bin/emulationstation --log-path /var/log --no-splash
+      ;;
+  esac
+  # Guard against a tight respawn storm if the frontend dies immediately.
+  sleep 0.3
+done
