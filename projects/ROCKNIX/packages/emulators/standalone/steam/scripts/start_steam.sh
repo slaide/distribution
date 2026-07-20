@@ -146,13 +146,29 @@ steam_drm_connector() {
   done
 }
 
-# Preferred (first-listed) mode of a connected external connector, e.g. 1920x1080.
+# Mode to drive a connected external connector at, e.g. 1920x1080. The sysfs
+# "modes" list is NOT reliably preferred-first on msm/DP -- reading it re-probes
+# and can surface a transient VESA fallback (1024x768) at the top, which gamescope
+# would then latch for the whole session (fixed logical res) -> blurry/stretched.
+# So don't trust list order: prefer 1920x1080 when offered (it matches the
+# built-in panel's effective resolution, so a docked<->handheld switch stays
+# native both ways), otherwise fall back to the largest-area mode listed.
 steam_drm_ext_mode() {
-  local f m
+  local f i best=""
   for f in /sys/class/drm/card*-DP-*/modes /sys/class/drm/card*-HDMI-A-*/modes; do
-    [ -f "$f" ] || continue
-    m=$(head -1 "$f" 2>/dev/null)
-    [ -n "$m" ] && { echo "$m"; return 0; }
+    [ -f "$f" ] && [ -s "$f" ] || continue
+    # msm/DP re-probes on every read and, during a master handoff, transiently
+    # exposes only VESA fallback modes (1024x768) with no 1920x1080 -- gamescope
+    # would then latch that low mode for the whole session. Poll briefly (~3s)
+    # for 1920x1080 to appear; only if the display genuinely never offers it fall
+    # back to the largest-area mode seen.
+    for i in $(seq 1 15); do
+      grep -qx '1920x1080' "$f" 2>/dev/null && { echo "1920x1080"; return 0; }
+      best=$(awk -F x 'NF==2 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { a=$1*$2; if (a>b){ b=a; m=$0 } }
+                       END { if (m) print m }' "$f")
+      sleep 0.2
+    done
+    [ -n "$best" ] && { echo "$best"; return 0; }
   done
 }
 
