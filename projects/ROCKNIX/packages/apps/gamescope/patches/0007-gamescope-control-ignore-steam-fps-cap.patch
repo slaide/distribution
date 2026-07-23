@@ -1,0 +1,33 @@
+gamescope: ignore Steam's frame-rate-cap control so our cap sticks
+
+The KONKR gamescope session owns its frame-rate cap (konkr-session-client on
+session start, device-controls live -- both via debug_set_fps_limit). With no
+QAM Performance tab, Steam pushes its own value through gamescope_control on
+connect (the panel refresh = effectively uncapped), which reset the app
+refresh-cycle override and clobbered our cap every session. Make the control a
+no-op; our cap is authoritative.
+
+--- a/src/wlserver.cpp
++++ b/src/wlserver.cpp
+@@ -1098,15 +1098,12 @@
+ 
+ static void gamescope_control_set_app_target_refresh_cycle( struct wl_client *client, struct wl_resource *resource, uint32_t fps, uint32_t flags )
+ {
+-	auto display_type = gamescope::GAMESCOPE_SCREEN_TYPE_EXTERNAL;
+-	if ( flags & GAMESCOPE_CONTROL_TARGET_REFRESH_CYCLE_FLAG_INTERNAL_DISPLAY )
+-		display_type = gamescope::GAMESCOPE_SCREEN_TYPE_INTERNAL;
+-
+-	steamcompmgr_set_app_refresh_cycle_override(
+-		display_type,
+-		fps,
+-		!!( flags & GAMESCOPE_CONTROL_TARGET_REFRESH_CYCLE_FLAG_ALLOW_REFRESH_SWITCHING ),
+-		!( flags & GAMESCOPE_CONTROL_TARGET_REFRESH_CYCLE_FLAG_ONLY_CHANGE_REFRESH_RATE ) );
++	// KONKR: fully ignore Steam's frame-rate-cap control. The cap is owned by us
++	// (konkr-session-client on session start + device-controls live, both via
++	// debug_set_fps_limit). With no QAM Performance tab, Steam pushes its own
++	// value through this control on connect -- the panel refresh, i.e. effectively
++	// uncapped -- which clobbered our cap back every session. Do nothing.
++	(void)client; (void)resource; (void)fps; (void)flags;
+ }
+ 
+ static void gamescope_control_take_screenshot( struct wl_client *client, struct wl_resource *resource, const char *path, uint32_t type, uint32_t flags )

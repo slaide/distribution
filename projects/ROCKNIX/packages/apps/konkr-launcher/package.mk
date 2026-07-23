@@ -28,7 +28,7 @@ make_target() {
     ${PKG_BUILD}/imgui_widgets.cpp \
     ${PKG_BUILD}/backends/imgui_impl_sdl2.cpp \
     ${PKG_BUILD}/backends/imgui_impl_sdlrenderer2.cpp \
-    -lSDL2 \
+    -lSDL2 -lX11 \
     -o ${PKG_BUILD}/konkr-launcher
 }
 

@@ -22,6 +22,21 @@ source /etc/profile
 export SDL_VIDEODRIVER=x11
 unset WAYLAND_DISPLAY
 
+# Apply the frame-rate cap now that the session gamescope is up (we are its
+# --child). gamescope's --framerate-limit startup flag does not stick -- its
+# dynamic refresh-cycle update resets it to 0 -- so the cap must be set through
+# the runtime override (gamescopectl debug_set_fps_limit). system.fps_limit is
+# the panel-refresh divisor the device-controls Display tab writes: 144/72/48, or
+# "0"/off = uncapped (FIFO still vsyncs to the 144Hz panel). Unset defaults to 72
+# so light Steam games don't render ~700fps and roast the fans. device-controls
+# changes this live the same way (no session restart).
+fps="$(get_setting system.fps_limit 2>/dev/null)"; [ -n "$fps" ] || fps="72"
+case "$fps" in ''|off|*[!0-9]*) fps=0 ;; esac
+for _ in 1 2 3 4 5; do
+  gamescopectl debug_set_fps_limit "$fps" >/dev/null 2>&1 && break
+  sleep 0.3
+done
+
 while :; do
   case "$(get_setting system.frontend)" in
     konkr-launcher|steam)

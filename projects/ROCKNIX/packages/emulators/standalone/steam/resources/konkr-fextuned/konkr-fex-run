@@ -62,4 +62,12 @@ fi
 export PROTON_ENABLE_WAYLAND=0
 unset WAYLAND_DISPLAY
 
+# FIFO present so gamescope's --framerate-limit (konkr-session, system.fps_limit)
+# can actually pace the game. gamescope's limiter throttles by withholding the
+# frame-done callback, which only slows a client that WAITS for it (FIFO). The
+# mailbox default (steamfex.h RECOMMENDED_ENV) renders without waiting, so a
+# light game spins the GPU to ~700fps regardless of the limit and roasts the
+# fans. FIFO caps to the limit (or the 144Hz panel when the cap is Off).
+export MESA_VK_WSI_PRESENT_MODE=fifo
+
 exec "$real_proton" "$@"

@@ -105,6 +105,13 @@ static bool read_small(const char *path, char *buf, size_t n)
 // device-controls. Cross-package include (see this package's package.mk -I).
 #include "steamfex_ui.h"
 
+// X11 — only to register this launcher as the gamescope session's baselayer (see
+// gamescope_register_baselayer). Included last so its macros (None/Window/...)
+// can't affect SDL/ImGui headers; the launcher uses none of those identifiers.
+#include <SDL_syswm.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+
 // --------------------------------------------------------------- systems
 
 struct System {
@@ -864,6 +871,38 @@ static void draw_footer(float width, float height)
 
 // --------------------------------------------------------------- main
 
+// Register this window as the gamescope session's "baselayer" so gamescope's
+// Steam-integration mode (-e) will show it. Under -e, gamescope's steamcompmgr
+// only gives focus to a window whose Steam appid (the STEAM_GAME X property) is
+// listed in the root window's GAMESCOPECTRL_BASELAYER_APPID; a plain non-Steam
+// window otherwise never gets focus and the screen stays black. Steam sets these
+// atoms for itself; a non-Steam frontend must do it by hand. We claim a synthetic
+// appid (0xFFFF0001, well above any real Steam appid) on our own window + the
+// root baselayer list. When Steam launches it overwrites the baselayer with its
+// own stack (games layer on top); the launcher exits on Steam launch and is
+// respawned by konkr-session-client afterwards, so it just re-asserts here on the
+// next start. No-op when not under X11 (e.g. the KONKR_SHOT offscreen path).
+static void gamescope_register_baselayer(SDL_Window *win)
+{
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(win, &wm) || wm.subsystem != SDL_SYSWM_X11)
+        return;
+    Display *dpy = wm.info.x11.display;
+    if (!dpy)
+        return;
+    // format-32 X properties are arrays of `long` (Xlib truncates each to 32
+    // bits on the wire) — must NOT pass a uint32_t* here.
+    long appid = 0xFFFF0001L;   // synthetic KONKR launcher appid
+    XChangeProperty(dpy, wm.info.x11.window,
+                    XInternAtom(dpy, "STEAM_GAME", False),
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&appid, 1);
+    XChangeProperty(dpy, DefaultRootWindow(dpy),
+                    XInternAtom(dpy, "GAMESCOPECTRL_BASELAYER_APPID", False),
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&appid, 1);
+    XFlush(dpy);
+}
+
 int main(int, char **)
 {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
@@ -882,6 +921,9 @@ int main(int, char **)
         fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError());
         return 1;
     }
+    // Make the launcher the gamescope session baselayer so it's visible under
+    // gamescope -e (Steam integration); harmless otherwise.
+    gamescope_register_baselayer(win);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

@@ -50,24 +50,32 @@ else
   PREFER_OUTPUT="--prefer-output DSI-1"
 fi
 
+# NOTE: the frame-rate cap (system.fps_limit) is NOT a gamescope startup flag --
+# --framerate-limit is reset to 0 by gamescope's dynamic refresh-cycle update, so
+# it never sticks. The cap is applied at runtime via `gamescopectl
+# debug_set_fps_limit` once the compositor is up: konkr-session-client sets it on
+# session start and device-controls changes it live. See konkr-session-client.
+
 # The built-in panel is portrait-mounted (KONKR: sway "transform 90" == gamescope
 # "right"). --force-orientation only affects gamescope's *internal* screen type,
 # so it is harmless on the landscape external. --use-rotation-shader: this DPU
 # can't hardware-rotate. --force-composition: it also can't direct-scan-out
-# across an output switch. --force-windows-fullscreen shows a non-Steam client
-# (the launcher) fullscreen without needing Steam's STEAM_GAME atom.
+# across an output switch.
 #
-# --xwayland-count 1 (NOT 2, the Deck default): with two Xwaylands gamescope
-# exports STEAM_GAME_DISPLAY_0=:1, so Steam launches games onto the second
-# Xwayland; bringing that display forward when a game appears is Steam-mode
-# (-e) work. We can't run -e here -- it puts gamescope in Steam-baselayer focus
-# mode, which shows nothing until a Steam baselayer appid is set and so blanks
-# our non-Steam launcher. With a single Xwayland, games land on :0 alongside the
-# Steam UI and gamescope's generic focus (+ --force-windows-fullscreen) shows
-# them. (Restoring -e -- and with it the Steam overlay/QAM + mangoapp -- needs
-# the launcher to register as gamescope's baselayer; tracked as follow-up work.)
+# -e (Steam integration) is the Steam Deck model: it enables the Steam
+# overlay/QAM, mangoapp (--mangoapp), and appid-based focus stacking that brings
+# a Steam-launched game (on the 2nd Xwayland -- gamescope exports
+# STEAM_GAME_DISPLAY_0=:1) forward over the Steam UI. Under -e steamcompmgr only
+# focuses a window whose STEAM_GAME appid is listed in the root
+# GAMESCOPECTRL_BASELAYER_APPID (appID==0 windows are not even focusable), so it
+# shows nothing until a baselayer is claimed. Our non-Steam frontend claims it:
+# konkr-launcher gamescope_register_baselayer() sets STEAM_GAME on its window +
+# the root baselayer to a synthetic appid. Steam takes the baselayer over while
+# it runs (games layer on top); the launcher exits on Steam launch and re-asserts
+# on its next start. (frontend=es does NOT claim a baselayer -> unsupported under
+# this -e session; KONKR ships konkr-launcher.)
 exec env -u WAYLAND_DISPLAY gamescope \
-  --backend drm --xwayland-count 1 --force-windows-fullscreen \
+  --backend drm --xwayland-count 2 --mangoapp -e \
   ${PREFER_OUTPUT} -W 1920 -H 1080 \
   --force-orientation right --use-rotation-shader --force-composition \
   -- /usr/bin/konkr-session-client

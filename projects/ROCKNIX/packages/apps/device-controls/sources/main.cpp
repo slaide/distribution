@@ -40,6 +40,13 @@
 #include "steamfex_ui.h"
 #include "wifi_ui.h"
 
+// X11 — only to register the full app as the gamescope session baselayer (see
+// gamescope_register_baselayer). Included last so its macros don't reach the SDL
+// / ImGui headers; the app uses none of those identifiers as bare tokens.
+#include <SDL_syswm.h>
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+
 using json = nlohmann::json;
 
 // Shared UI state declared extern in theme.h; defined here (this is the primary
@@ -1478,10 +1485,91 @@ void external_display_section()
     }
 }
 
+// ---------- frame-rate cap (gamescope session only) ----------
+// Caps the game render rate to a divisor of the 144 Hz panel (144/72/48); "0" =
+// uncapped (FIFO still vsyncs to 144). Applied via gamescope's runtime override
+// (gamescopectl debug_set_fps_limit): konkr-session-client sets it on session
+// start, this tab changes it live. gamescope's --framerate-limit startup flag
+// does NOT stick (its refresh-cycle update resets it to 0). Only meaningful under
+// the gamescope session, so shown only there; the wlr-randr control below is
+// sway-only (empty under gamescope).
+static const int   FPSCAP_HZ[]     = { 144, 72, 48, 0 };
+static const char *FPSCAP_LABELS[] = { "144", "72", "48", "Off" };
+enum { FPSCAP_N = 4 };
+
+// True when the persistent gamescope session is selected (cached once).
+static bool session_is_gamescope()
+{
+    static int gs = -1;
+    if (gs < 0) {
+        std::string c = run_cmd(". /etc/profile 2>/dev/null; "
+                                "get_setting system.compositor 2>/dev/null");
+        gs = (c.rfind("gamescope", 0) == 0) ? 1 : 0;
+    }
+    return gs == 1;
+}
+
+static int fpscap_get()
+{
+    std::string out = run_cmd(". /etc/profile 2>/dev/null; "
+                              "get_setting system.fps_limit 2>/dev/null");
+    size_t p = out.find_first_not_of(" \t\r\n");
+    if (p == std::string::npos) return 72;   // unset -> konkr-session's default
+    return atoi(out.c_str() + p);
+}
+
+static void fpscap_set(int hz)
+{
+    char cmd[512];
+    // Persist + apply LIVE via gamescope's runtime override -- no session restart.
+    // gamescope's --framerate-limit startup flag does not stick (its refresh-cycle
+    // update resets it to 0), so debug_set_fps_limit is the authoritative path and
+    // it takes effect immediately. 0 = uncapped (FIFO still vsyncs to the 144 Hz
+    // panel). gamescopectl needs the session runtime dir + display; this app is a
+    // session client so it inherits them (with a fallback just in case).
+    snprintf(cmd, sizeof cmd,
+             ". /etc/profile 2>/dev/null; "
+             "set_setting system.fps_limit %d; "
+             "XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/var/run/0-runtime-dir}\" "
+             "GAMESCOPE_WAYLAND_DISPLAY=\"${GAMESCOPE_WAYLAND_DISPLAY:-gamescope-0}\" "
+             "gamescopectl debug_set_fps_limit %d >/dev/null 2>&1",
+             hz, hz);
+    run_cmd(cmd);
+}
+
+static void framerate_cap_section()
+{
+    if (!session_is_gamescope()) return;   // --framerate-limit is a session flag
+    static int cur = -2;
+    if (cur == -2) cur = fpscap_get();
+    ImGui::TextUnformatted("Frame rate limit");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(fps cap; scanout stays 144 Hz)");
+    for (int i = 0; i < FPSCAP_N; i++) {
+        bool active = FPSCAP_HZ[i] == cur;
+        if (active) {
+            ImGui::PushStyleColor(ImGuiCol_Button, C_ACCENT_BG);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, dc_rgb(0xF0A83C, 0.26f));
+            ImGui::PushStyleColor(ImGuiCol_Text, C_ACCENT);
+        }
+        if (ImGui::Button(FPSCAP_LABELS[i])) {
+            cur = FPSCAP_HZ[i];
+            fpscap_set(cur);
+        }
+        if (active) ImGui::PopStyleColor(3);
+        if (i + 1 < FPSCAP_N) ImGui::SameLine();
+    }
+}
+
 static void tab_display()
 {
     external_display_section();
     ImGui::Separator();
+    framerate_cap_section();
+    // The resolution / refresh-rate control below is wlr-randr-based (sway only);
+    // under the gamescope session it reports nothing, so stop here.
+    if (session_is_gamescope())
+        return;
 
     struct DMode { std::string res, exact, label; };
     static std::string out_name, phys, res, cur_refresh, status;
@@ -2476,6 +2564,33 @@ void tab_wifi() { wifiui::draw(); }
 
 int run_sidebar();   // sidebar.cpp — Wayland layer-shell quick-settings overlay
 
+// Register the full app as the gamescope session baselayer so it's visible under
+// gamescope -e. Same synthetic appid as konkr-launcher (0xFFFF0001): under -e,
+// appID==0 windows are not focusable, and gamescope prefers the higher
+// map_sequence among windows sharing an appid (steamcompmgr is_focus_priority) --
+// so this app (mapped after the launcher, which stays mapped behind us while it
+// blocks in system()) is shown while open, and the launcher reappears when we
+// exit. No-op when not under X11 (e.g. the sway path). The --sidebar overlay does
+// NOT use this -- it shows via the GAMESCOPE_EXTERNAL_OVERLAY plane instead.
+static void gamescope_register_baselayer(SDL_Window *win)
+{
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(win, &wm) || wm.subsystem != SDL_SYSWM_X11)
+        return;
+    Display *dpy = wm.info.x11.display;
+    if (!dpy)
+        return;
+    long appid = 0xFFFF0001L;   // must match konkr-launcher gamescope_register_baselayer
+    XChangeProperty(dpy, wm.info.x11.window,
+                    XInternAtom(dpy, "STEAM_GAME", False),
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&appid, 1);
+    XChangeProperty(dpy, DefaultRootWindow(dpy),
+                    XInternAtom(dpy, "GAMESCOPECTRL_BASELAYER_APPID", False),
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&appid, 1);
+    XFlush(dpy);
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--restore"))
@@ -2498,6 +2613,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "SDL window/renderer: %s\n", SDL_GetError());
         return 1;
     }
+    // Be the gamescope baselayer so this window is visible under -e (harmless
+    // otherwise); the launcher behind us reappears when we exit.
+    gamescope_register_baselayer(win);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
