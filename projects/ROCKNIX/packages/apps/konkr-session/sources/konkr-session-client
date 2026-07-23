@@ -37,7 +37,16 @@ for _ in 1 2 3 4 5; do
   sleep 0.3
 done
 
+# Make non-Steam apps visible under gamescope -e. Under -e gamescope only focuses
+# windows carrying a STEAM_GAME appid; emulators / PortMaster ports / ES / tool
+# apps don't set one, so they'd render black. konkr-baselayer tags every such
+# window (leaving Steam's own alone) with the shared frontend appid. Session-long
+# background daemon; re-checked each supervisor iteration so it respawns if it dies.
+baselayer_up() { ps -eo comm | grep -qx konkr-baselayer; }
+baselayer_up || /usr/bin/konkr-baselayer &
+
 while :; do
+  baselayer_up || /usr/bin/konkr-baselayer &
   case "$(get_setting system.frontend)" in
     konkr-launcher|steam)
       # Boot-straight-to-Steam under the session is future work; the launcher is
