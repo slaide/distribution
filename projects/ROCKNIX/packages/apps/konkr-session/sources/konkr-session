@@ -56,8 +56,18 @@ fi
 # can't hardware-rotate. --force-composition: it also can't direct-scan-out
 # across an output switch. --force-windows-fullscreen shows a non-Steam client
 # (the launcher) fullscreen without needing Steam's STEAM_GAME atom.
+#
+# --xwayland-count 1 (NOT 2, the Deck default): with two Xwaylands gamescope
+# exports STEAM_GAME_DISPLAY_0=:1, so Steam launches games onto the second
+# Xwayland; bringing that display forward when a game appears is Steam-mode
+# (-e) work. We can't run -e here -- it puts gamescope in Steam-baselayer focus
+# mode, which shows nothing until a Steam baselayer appid is set and so blanks
+# our non-Steam launcher. With a single Xwayland, games land on :0 alongside the
+# Steam UI and gamescope's generic focus (+ --force-windows-fullscreen) shows
+# them. (Restoring -e -- and with it the Steam overlay/QAM + mangoapp -- needs
+# the launcher to register as gamescope's baselayer; tracked as follow-up work.)
 exec env -u WAYLAND_DISPLAY gamescope \
-  --backend drm --xwayland-count 2 --force-windows-fullscreen \
+  --backend drm --xwayland-count 1 --force-windows-fullscreen \
   ${PREFER_OUTPUT} -W 1920 -H 1080 \
   --force-orientation right --use-rotation-shader --force-composition \
   -- /usr/bin/konkr-session-client

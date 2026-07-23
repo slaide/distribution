@@ -52,4 +52,14 @@ if [ -z "$real_proton" ]; then
   exit 1
 fi
 
+# Force the X11 path. proton-cachyos otherwise defaults to its native Wayland
+# driver (PROTON_ENABLE_WAYLAND=1, winewayland.drv; winex11.drv disabled) when it
+# detects the gamescope Wayland session -- but the persistent konkr-session
+# gamescope is not started with --expose-wayland, so it composites only its
+# Xwayland clients. A winewayland game then renders correctly (its own swapchain)
+# yet presents to a surface gamescope never shows -> black screen. Pinning X11
+# makes the game an Xwayland client on :0 that gamescope composites and focuses.
+export PROTON_ENABLE_WAYLAND=0
+unset WAYLAND_DISPLAY
+
 exec "$real_proton" "$@"
