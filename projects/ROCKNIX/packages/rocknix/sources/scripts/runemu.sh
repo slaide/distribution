@@ -8,6 +8,23 @@
 . /etc/profile
 . /etc/os-release
 
+### Under the persistent gamescope session (konkr-session) emulators run as
+### secondary gamescope clients on Xwayland :0. The env inherited from gamescope
+### carries its Vulkan-WSI enablers, which are only valid for the --child chain:
+### with them set a secondary client's WSI layer mis-hooks and crashes on video
+### init (same trap start_steam.sh handles for Steam). Keep
+### MESA_LOADER_DRIVER_OVERRIDE -- zink IS this device's GL driver (095-force_zink).
+### SDL_VIDEODRIVER: /etc/profile above re-exported the sway default (wayland);
+### under the session clients must attach to Xwayland. gamescope exposes no
+### wayland socket to secondary clients, so also drop any stray WAYLAND_DISPLAY.
+### Window visibility under -e is handled by konkr-baselayer stamping the
+### emulator window with the shared frontend appid.
+if [ -n "${GAMESCOPE_WAYLAND_DISPLAY}" ]; then
+  unset ENABLE_GAMESCOPE_WSI vk_xwayland_wait_ready
+  unset WAYLAND_DISPLAY
+  export SDL_VIDEODRIVER=x11
+fi
+
 ### Switch to performance mode early to speed up configuration and reduce time it takes to get into games.
 performance
 

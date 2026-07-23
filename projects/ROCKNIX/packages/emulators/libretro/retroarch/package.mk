@@ -52,6 +52,14 @@ case ${DEVICE} in
   RK*)
     PKG_DEPENDS_TARGET+=" librga"
   ;;
+  SM8750)
+    # Persistent gamescope session (konkr-session): emulators run as Xwayland
+    # clients. gamescope exposes no wayland socket to secondary clients and owns
+    # DRM (so KHR_display is unavailable) -- RetroArch needs the x11 video
+    # contexts (GLX + Vulkan-X11). Appended after --disable-x11; last flag wins.
+    PKG_DEPENDS_TARGET+=" libX11 libXext libXxf86vm libXinerama libXrandr"
+    PKG_CONFIGURE_OPTS_TARGET+=" --enable-x11"
+  ;;
 esac
 
 if [ "${DISPLAYSERVER}" = "wl" ]; then
