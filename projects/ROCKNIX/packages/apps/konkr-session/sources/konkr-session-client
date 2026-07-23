@@ -37,6 +37,20 @@ for _ in 1 2 3 4 5; do
   sleep 0.3
 done
 
+# Apply the external-display preference. konkr-session always lists externals
+# ahead of DSI-1 in --prefer-output; pref=ignore is expressed through gamescope's
+# GAMESCOPE_DISPLAY_FORCE_INTERNAL root property (its runtime output switch --
+# steamcompmgr re-picks the connector live, clients survive). Set explicitly in
+# BOTH states: the property lives in Xwayland, so a session restart resets it.
+# Runs after the fps-cap loop above, i.e. once gamescope's main loop is
+# demonstrably serving requests. device-controls toggles the same property live.
+pref="$(get_setting system.external_display 2>/dev/null)"; [ -n "$pref" ] || pref="external"
+if [ "$pref" = "ignore" ]; then
+  /usr/bin/konkr-forceinternal 1
+else
+  /usr/bin/konkr-forceinternal 0
+fi
+
 # Make non-Steam apps visible under gamescope -e. Under -e gamescope only focuses
 # windows carrying a STEAM_GAME appid; emulators / PortMaster ports / ES / tool
 # apps don't set one, so they'd render black. konkr-baselayer tags every such

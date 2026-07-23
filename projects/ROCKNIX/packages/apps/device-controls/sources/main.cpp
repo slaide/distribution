@@ -1431,18 +1431,20 @@ void extdisp_set(int idx)
     if (idx < 0 || idx >= EXTDISP_N) return;
     char cmd[512];
     // Persist, then apply. Under sway, output_monitor re-routes live. Under the
-    // persistent gamescope session gamescope's --prefer-output is fixed at start
-    // (no live output-switch; forcing DRM connector status corrupts the EDID),
-    // so re-pick the output by restarting konkr-session -- a brief reload, fine
-    // for a deliberate change. Plug/unplug itself already auto-migrates and does
-    // not need this. Backgrounded so neither path stalls the UI.
+    // persistent gamescope session, apply through gamescope's runtime output
+    // switch: konkr-forceinternal sets GAMESCOPE_DISPLAY_FORCE_INTERNAL on the
+    // :0 root and steamcompmgr re-picks the connector live -- clients survive.
+    // (The old apply path restarted konkr-session, which killed every session
+    // client: a running emulator/game died on toggle. Never force DRM connector
+    // status either; that corrupts the EDID.) Backgrounded so neither path
+    // stalls the UI.
     snprintf(cmd, sizeof cmd,
              ". /etc/profile 2>/dev/null; "
              "set_setting system.external_display %s; "
              "{ if [ \"$(get_setting system.compositor)\" = gamescope ]; then "
-                 "systemctl --no-block restart konkr-session.service; "
+                 "DISPLAY=:0.0 /usr/bin/konkr-forceinternal %d; "
                "else /usr/bin/output_monitor apply; fi; } >/dev/null 2>&1 &",
-             EXTDISP_MODES[idx]);
+             EXTDISP_MODES[idx], idx == 1 ? 1 : 0);
     run_cmd(cmd);
 }
 

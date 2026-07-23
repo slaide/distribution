@@ -23,18 +23,20 @@ chmod 700 "${XDG_RUNTIME_DIR}"
 [ -S "${XDG_RUNTIME_DIR}/bus" ] || \
   dbus-daemon --session --address="unix:path=${XDG_RUNTIME_DIR}/bus" &
 
-# --- Output selection: the built-in panel, or an attached external display when
-# preferred (system.external_display). Same policy as the Steam launcher; the
-# fixed logical resolution is native on both the panel (1080x1920 rotated ==
+# --- Output selection: the built-in panel, or an attached external display.
+# The fixed logical resolution is native on both the panel (1080x1920 rotated ==
 # 1920x1080 effective) and a 1080p external. ---
 # List EVERY external connector that exists (the /sys node is present even while
-# disconnected) ahead of the internal panel when the user prefers external
-# output. gamescope re-evaluates --prefer-output on hotplug, so with the external
-# already in the list it auto-migrates onto a display the moment it is plugged
-# and falls back to DSI-1 on unplug -- no session restart, no output_monitor.
-# pref=ignore leaves the externals out entirely, so a plugged cable is a no-op
-# (internal only); switching that preference is applied by restarting the session
-# (device-controls does this) since --prefer-output is fixed at gamescope start.
+# disconnected) ahead of the internal panel, ALWAYS. gamescope re-evaluates
+# --prefer-output on hotplug, so with the external already in the list it
+# auto-migrates onto a display the moment it is plugged and falls back to DSI-1
+# on unplug -- no session restart, no output_monitor.
+# The system.external_display preference (external|ignore) is NOT encoded here:
+# it is applied at runtime through gamescope's own GAMESCOPE_DISPLAY_FORCE_INTERNAL
+# root property (konkr-forceinternal; steamcompmgr re-picks the connector live),
+# by konkr-session-client at session start and by device-controls on toggle.
+# The old scheme (pref baked into --prefer-output + session restart to apply)
+# killed every session client -- a running emulator/game died on toggle.
 ext_list=""
 for s in /sys/class/drm/card*-DP-*/status \
          /sys/class/drm/card*-HDMI-A-*/status \
@@ -43,12 +45,7 @@ for s in /sys/class/drm/card*-DP-*/status \
   name="$(basename "$(dirname "$s")")"; name="${name#card*-}"
   ext_list="${ext_list}${name},"
 done
-pref="$(get_setting system.external_display 2>/dev/null)"; [ -n "$pref" ] || pref="external"
-if [ "$pref" = "external" ] && [ -n "$ext_list" ]; then
-  PREFER_OUTPUT="--prefer-output ${ext_list}DSI-1"
-else
-  PREFER_OUTPUT="--prefer-output DSI-1"
-fi
+PREFER_OUTPUT="--prefer-output ${ext_list}DSI-1"
 
 # NOTE: the frame-rate cap (system.fps_limit) is NOT a gamescope startup flag --
 # --framerate-limit is reset to 0 by gamescope's dynamic refresh-cycle update, so

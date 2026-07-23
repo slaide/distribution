@@ -16,6 +16,11 @@ make_target() {
   ${CC} ${CFLAGS} ${LDFLAGS} -std=gnu11 -Wall \
     ${PKG_DIR}/sources/konkr-baselayer.c -lX11 \
     -o ${PKG_BUILD}/konkr-baselayer
+  # konkr-forceinternal: runtime internal/external output switch via the
+  # GAMESCOPE_DISPLAY_FORCE_INTERNAL root property (no session restart).
+  ${CC} ${CFLAGS} ${LDFLAGS} -std=gnu11 -Wall \
+    ${PKG_DIR}/sources/konkr-forceinternal.c -lX11 \
+    -o ${PKG_BUILD}/konkr-forceinternal
 }
 
 makeinstall_target() {
@@ -23,7 +28,8 @@ makeinstall_target() {
   cp ${PKG_DIR}/sources/konkr-session ${INSTALL}/usr/bin/
   cp ${PKG_DIR}/sources/konkr-session-client ${INSTALL}/usr/bin/
   cp ${PKG_BUILD}/konkr-baselayer ${INSTALL}/usr/bin/
-  chmod 0755 ${INSTALL}/usr/bin/konkr-session ${INSTALL}/usr/bin/konkr-session-client ${INSTALL}/usr/bin/konkr-baselayer
+  cp ${PKG_BUILD}/konkr-forceinternal ${INSTALL}/usr/bin/
+  chmod 0755 ${INSTALL}/usr/bin/konkr-session ${INSTALL}/usr/bin/konkr-session-client ${INSTALL}/usr/bin/konkr-baselayer ${INSTALL}/usr/bin/konkr-forceinternal
 
   mkdir -p ${INSTALL}/usr/lib/systemd/system
   cp ${PKG_DIR}/system.d/konkr-session.service \
