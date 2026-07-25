@@ -37,6 +37,11 @@
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
+// Shared with device-controls (cross-package -I, see this package's package.mk):
+// finger drag/flick scrolling, hover cleanup after a tap, and the one-frame press
+// hold-back that makes a gamescope-synthesised tap land on the first try.
+#include "touch.h"
+#include "touch_sdl.h"
 
 // ----------------------------------------------------------- small helpers
 
@@ -281,6 +286,9 @@ static void apply_style()
     st.ItemInnerSpacing = ImVec2(9 * u, 6 * u);
     st.ScrollbarSize    = 10 * u;
     st.IndentSpacing    = 24 * u;
+    // Forgive an imprecise finger at a tile's edge. Small on purpose: ImGui does
+    // not sort by overlap, so a large pad lets a widget steal its neighbour's tap.
+    st.TouchExtraPadding = ImVec2(3 * u, 3 * u);
     st.WindowRounding   = 0;
     st.ChildRounding    = 10 * u;
     st.FrameRounding    = 8 * u;
@@ -965,8 +973,17 @@ int main(int, char **)
     while (!g_quit) {
         Uint32 frame_start = SDL_GetTicks();
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
+        static DcTouchFix touchfix;
+        dc_sdl_batch_begin(touchfix);
+        // dc_sdl_poll, not SDL_PollEvent: a tap's press is held back a frame so an
+        // AllowOverlap widget is hovered by the time it lands (see touch_sdl.h).
+        while (dc_sdl_poll(touchfix, &ev)) {
+            // Before ImGui sees it: traces the stream and tracks the move that
+            // dc_sdl_poll keys the hold-back on.
+            bool lifted = dc_sdl_touchify(touchfix, &ev);
             ImGui_ImplSDL2_ProcessEvent(&ev);
+            if (lifted)
+                dc_touch_park();   // stop the tapped tile rendering as hovered
             if (ev.type == SDL_QUIT)
                 g_quit = true;
             if (ev.type == SDL_CONTROLLERBUTTONDOWN && !g_modal_open) {
@@ -1012,6 +1029,7 @@ int main(int, char **)
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
+        dc_imgui_log_frame();   // KONKR_TOUCH_LOG=1: what ImGui made of the input
 
         const ImGuiViewport *vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -1030,6 +1048,7 @@ int main(int, char **)
                             ImVec2(24 * g_ui, 18 * g_ui));
         ImGui::BeginChild("##content", ImVec2(0, vp->WorkSize.y - hdr_h - ftr_h),
                           ImGuiChildFlags_AlwaysUseWindowPadding);
+        dc_touch_scroll();   // finger drag/flick scrolls the ROM grid
         if (g_sec == SEC_STEAM)
             draw_steam_tab();
         else if (g_sec == SEC_TOOLS)

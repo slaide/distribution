@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 // device-controls --sidebar — Android-style quick-settings overlay.
 //
-// A separate windowing backend from the SDL2 control panel: a Wayland
-// zwlr_layer_shell_v1 OVERLAY surface (renders above a fullscreen game) drawn
-// with EGL/GLES2 + Dear ImGui. Launched by konkr-inputd's reserved KONKR
-// long-press. Gamepad navigation arrives over the daemon socket in "intercept
-// mode" (the game underneath is frozen); touch works directly.
+// Launched by konkr-inputd's reserved KONKR long-press, over whatever session is
+// live. Two windowing backends, both separate from the SDL2 control panel's, are
+// picked by run_sidebar() from the environment konkr-inputd hands us:
 //
-// Only works under sway (the normal session). Steam's gamescope path stops
-// sway, so there is no Wayland compositor to attach to — we detect that and
-// exit cleanly (KONKR=Guide opens Steam's own menu there).
+//   - sway: a Wayland zwlr_layer_shell_v1 OVERLAY surface drawn with EGL/GLES2.
+//     The panel is the whole surface; pointer/touch arrive as ordinary wl input.
+//   - gamescope: an SDL2 window on the overlay XWayland (:0) claiming
+//     gamescope's overlay layer with input focus, so it is composited over the
+//     game AND receives touch (see x11_mark_overlay). Here the surface spans the
+//     output and the panel occupies its left half.
+//
+// Gamepad navigation arrives on the daemon socket in "intercept mode" in both
+// (the session underneath is frozen), including LB/RB to step sections.
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +41,7 @@
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
 #include "theme.h"
+#include "touch.h"
 
 // ----------------------------------------------------------- small helpers
 
@@ -136,19 +141,36 @@ static const wl_pointer_listener ptr_listener = {
 };
 
 // ---- touch (mapped to the mouse for ImGui) ----
+// The source tag matters: told the press came from a touchscreen, ImGui holds it
+// back by one frame so the widget under the finger registers as hovered before it
+// is pressed (#2702, "TouchScreen have no initial hover"). Without the tag the
+// press is applied against a stale hover state and taps land on the wrong widget
+// — or on nothing.
 static void touch_down(void *, wl_touch *, uint32_t, uint32_t, wl_surface *, int32_t,
                        wl_fixed_t x, wl_fixed_t y)
 {
     ImGuiIO &io = ImGui::GetIO();
+    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
     io.AddMousePosEvent((float)wl_fixed_to_double(x), (float)wl_fixed_to_double(y));
     io.AddMouseButtonEvent(0, true);
 }
 static void touch_up(void *, wl_touch *, uint32_t, uint32_t, int32_t)
-{ ImGui::GetIO().AddMouseButtonEvent(0, false); }
+{
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+    dc_touch_park();   // else the tapped widget stays lit as "hovered"
+}
 static void touch_motion(void *, wl_touch *, uint32_t, int32_t, wl_fixed_t x, wl_fixed_t y)
-{ ImGui::GetIO().AddMousePosEvent((float)wl_fixed_to_double(x), (float)wl_fixed_to_double(y)); }
+{
+    ImGuiIO &io = ImGui::GetIO();
+    io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);
+    io.AddMousePosEvent((float)wl_fixed_to_double(x), (float)wl_fixed_to_double(y));
+}
 static void touch_frame(void *, wl_touch *) {}
-static void touch_cancel(void *, wl_touch *) {}
+static void touch_cancel(void *, wl_touch *)
+{
+    ImGui::GetIO().AddMouseButtonEvent(0, false);
+    dc_touch_park();
+}
 static void touch_shape(void *, wl_touch *, int32_t, wl_fixed_t, wl_fixed_t) {}
 static void touch_orient(void *, wl_touch *, int32_t, wl_fixed_t) {}
 static const wl_touch_listener touch_listener = {
@@ -214,6 +236,9 @@ static const wl_callback_listener frame_listener = { frame_done };
 
 // ----------------------------------------------------- daemon nav events
 
+// Pending LB/RB tab step from the daemon, applied by draw_ui.
+static int g_tab_delta = 0;
+
 static void read_daemon_events()
 {
     char buf[512];
@@ -242,6 +267,15 @@ static void read_daemon_events()
                 // B = ImGui nav "back" (exit a combo/widget), NOT close. Close
                 // via the Close tab entry or by pressing the opener again.
                 io.AddKeyEvent(ImGuiKey_GamepadFaceRight, v != 0);
+            } else if (!strcmp(dir, "tabprev")) {
+                // LB/RB step the section list. The daemon already translates
+                // BTN_TL/BTN_TR to these while it holds intercept; we own the
+                // selection here because the list is Selectables, not a tab bar.
+                if (v)
+                    g_tab_delta--;
+            } else if (!strcmp(dir, "tabnext")) {
+                if (v)
+                    g_tab_delta++;
             }
         }
     }
@@ -357,10 +391,16 @@ static void draw_ui(int uw, int uh)
 {
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2((float)uw, (float)uh));
+    // Deliberately WITHOUT NoBringToFrontOnFocus, unlike the scrim behind it: that
+    // flag makes CreateNewWindow() push the window to the *back* of the display
+    // order (g.Windows.push_front), so carrying it on both windows reversed them —
+    // the scrim, created first, ended up in front of the panel, took every hit test
+    // (FindHoveredWindowEx walks front to back) and swallowed all touch, leaving the
+    // sidebar gamepad-only. Without it this window is push_back'd to the front and
+    // stays there, since the scrim keeping the flag can never rise above it.
     ImGui::Begin("konkr-sidebar", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                 ImGuiWindowFlags_NoBringToFrontOnFocus);
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
     // compact header: brand + section label (left), clock (right). Decorative,
     // so NoNav keeps it out of the gamepad focus chain.
@@ -385,10 +425,21 @@ static void draw_ui(int uw, int uh)
     ImGui::Spacing();
 
     static const char *names[] = { "Quick", "Wi-Fi", "Power", "Steam", "Buttons", "Fan", "RGB" };
+    const int n_tabs = (int)(sizeof(names) / sizeof(*names));
     static int tab = 0;
     static bool enter_content = false;   // tab bar -> content, handed this frame
     static bool enter_tabbar = false;    // content -> tab bar, handed next frame
     float row = ImGui::GetFontSize() * 1.9f;
+
+    // LB/RB step the section. Skipped while a widget owns the press (a slider
+    // being dragged, an open combo), where the shoulders belong to the widget.
+    if (g_tab_delta && !ImGui::IsAnyItemActive()) {
+        tab = (tab + g_tab_delta) % n_tabs;
+        if (tab < 0)
+            tab += n_tabs;
+        enter_tabbar = true;   // move the nav cursor onto the new section
+    }
+    g_tab_delta = 0;
 
     // Left vertical tab bar (gamepad-navigable), plus Close at the bottom.
     ImGui::BeginChild("tabbar", ImVec2(ImGui::GetFontSize() * 7.0f, 0),
@@ -421,6 +472,7 @@ static void draw_ui(int uw, int uh)
 
     ImGui::SameLine();
     ImGui::BeginChild("content", ImVec2(0, 0), ImGuiChildFlags_NavFlattened);
+    dc_touch_scroll();   // finger drag/flick scrolls the section body
     if (enter_content) {
         ImGui::SetKeyboardFocusHere();   // focus the first widget in the tab
         enter_content = false;
@@ -439,6 +491,38 @@ static void draw_ui(int uw, int uh)
     ImGui::EndChild();
 
     ImGui::End();
+}
+
+// Full-screen scrim behind the panel, used on the gamescope path where our
+// surface covers the whole output. It dims the frozen session so the overlay
+// reads as "this has input now", and a tap beside the panel dismisses it — the
+// Android quick-settings gesture, and the only way to close the overlay by touch
+// alone (the gamepad has the opener and the Close entry).
+static void draw_scrim(int screen_w, int screen_h, int panel_w)
+{
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2((float)screen_w, (float)screen_h));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0.45f));
+    // NoBringToFrontOnFocus keeps this at the back of the display order even when
+    // tapped, so it stays underneath the panel — which for that very reason must
+    // NOT carry the same flag (see draw_ui).
+    ImGui::Begin("##scrim", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoScrollbar |
+                 ImGuiWindowFlags_NoBringToFrontOnFocus |
+                 ImGuiWindowFlags_NoNavFocus);
+    ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);   // touch-only affordance
+    int dismiss_w = screen_w - panel_w;
+    if (dismiss_w > 0) {
+        ImGui::SetCursorPos(ImVec2((float)panel_w, 0));
+        if (ImGui::InvisibleButton("##dismiss",
+                                   ImVec2((float)dismiss_w, (float)screen_h)))
+            g_quit = true;
+    }
+    ImGui::PopItemFlag();
+    ImGui::End();
+    ImGui::PopStyleColor();
 }
 
 // ----------------------------------------------------------------- run
@@ -611,18 +695,36 @@ static int run_sidebar_wayland()
     return 0;
 }
 
-// ---- gamescope path: SDL2 window on the overlay XWayland (:0) marked as the
-// GAMESCOPE_EXTERNAL_OVERLAY, composited over the game. Nav comes from the
-// daemon's intercept mode (gamescope owns input; the overlay is passive). ----
+// ---- gamescope path: SDL2 window on the overlay XWayland (:0), composited over
+// the game as gamescope's *overlay* window. ----
 // X11/SDL headers go here, after all the Wayland code, so X11's macros (None,
 // Bool, ...) can't clash with it.
 #include <SDL.h>
 #include <SDL_syswm.h>
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
+#include "touch_sdl.h"
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 
+// Claim gamescope's overlay layer *with input focus*.
+//
+// This used to set GAMESCOPE_EXTERNAL_OVERLAY, which composites but is never
+// eligible for input: steamcompmgr only ever assigns inputFocusWindow to the
+// focusWindow or to the overlayWindow, so the external overlay got no pointer and
+// no touch at all — the reason the sidebar was gamepad-only under gamescope while
+// touch worked fine on the sway/layer-shell path.
+//
+// STEAM_OVERLAY + STEAM_INPUT_FOCUS is what Steam's own overlay/QAM uses, and it
+// does make the window the input focus. Two conditions come with it:
+//   - steamcompmgr only treats an overlay wider than 1200px as *the* overlay
+//     (narrower ones are classified as notifications), and
+//   - touch is mapped through the topmost layer's scale/offset, which is ours
+//     once we are the overlay — so only a full-output-size window maps 1:1.
+// Hence the fullscreen surface, with the panel drawn into its left portion and
+// the rest left transparent (see draw_scrim). Rotation is handled by gamescope
+// itself (apply_touchscreen_orientation), so nothing here knows about the
+// portrait panel.
 static void x11_mark_overlay(SDL_Window *win)
 {
     SDL_SysWMinfo wm;
@@ -632,7 +734,9 @@ static void x11_mark_overlay(SDL_Window *win)
     Display *xd = wm.info.x11.display;
     Window xw = wm.info.x11.window;
     unsigned long one = 1, opaque = 0xffffffffUL;
-    XChangeProperty(xd, xw, XInternAtom(xd, "GAMESCOPE_EXTERNAL_OVERLAY", False),
+    XChangeProperty(xd, xw, XInternAtom(xd, "STEAM_OVERLAY", False),
+                    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&one, 1);
+    XChangeProperty(xd, xw, XInternAtom(xd, "STEAM_INPUT_FOCUS", False),
                     XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&one, 1);
     XChangeProperty(xd, xw, XInternAtom(xd, "_NET_WM_WINDOW_OPACITY", False),
                     XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&opaque, 1);
@@ -648,12 +752,16 @@ static int run_sidebar_x11()
     SDL_DisplayMode dm;
     int sw = 1920, sh = 1080;
     if (SDL_GetDesktopDisplayMode(0, &dm) == 0) { sw = dm.w; sh = dm.h; }
-    int w = (int)(sw * 0.50f);   // room for the tab bar + settings widgets
-    if (w < 640)
-        w = 640;
-    // Placed at x=0: gamescope's --force-orientation rotation put a right-edge
-    // window on the physical left, so anchor at the origin instead.
-    SDL_Window *win = SDL_CreateWindow("konkr-sidebar", 0, 0, w, sh,
+    // The surface spans the whole output (required to be the input-focused
+    // overlay — see x11_mark_overlay); the panel itself occupies the left half,
+    // anchored at the origin because gamescope's --force-orientation rotation put
+    // a right-edge window on the physical left.
+    int panel_w = (int)(sw * 0.50f);   // room for the tab bar + settings widgets
+    if (panel_w < 640)
+        panel_w = 640;
+    if (panel_w > sw)
+        panel_w = sw;
+    SDL_Window *win = SDL_CreateWindow("konkr-sidebar", 0, 0, sw, sh,
                                        SDL_WINDOW_BORDERLESS | SDL_WINDOW_SHOWN);
     if (!win) {
         fprintf(stderr, "sidebar(x11): window: %s\n", SDL_GetError());
@@ -686,10 +794,19 @@ static int run_sidebar_x11()
     daemon_connect();
     overlay_enter();
 
+    DcTouchFix touchfix;
     while (!g_quit) {
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
+        dc_sdl_batch_begin(touchfix);
+        // dc_sdl_poll, not SDL_PollEvent: a tap's press is held back a frame so an
+        // AllowOverlap widget is hovered by the time it lands (see touch_sdl.h).
+        while (dc_sdl_poll(touchfix, &ev)) {
+            // Before ImGui sees it: traces the stream and tracks the move that
+            // dc_sdl_poll keys the hold-back on.
+            bool lifted = dc_sdl_touchify(touchfix, &ev);
             ImGui_ImplSDL2_ProcessEvent(&ev);
+            if (lifted)
+                dc_touch_park();   // stop the tapped widget rendering as hovered
             if (ev.type == SDL_QUIT)
                 g_quit = true;
         }
@@ -705,7 +822,9 @@ static int run_sidebar_x11()
         // feed from the daemon's intercept.
         io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
         ImGui::NewFrame();
-        draw_ui(w, sh);
+        dc_imgui_log_frame();          // KONKR_TOUCH_LOG=1
+        draw_scrim(sw, sh, panel_w);   // dim + tap-beside-the-panel to dismiss
+        draw_ui(panel_w, sh);
         ImGui::Render();
         SDL_SetRenderDrawColor(ren, 0, 0, 0, 0);
         SDL_RenderClear(ren);

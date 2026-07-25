@@ -37,6 +37,8 @@
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_sdlrenderer2.h"
 #include "theme.h"
+#include "touch.h"
+#include "touch_sdl.h"
 #include "steamfex_ui.h"
 #include "wifi_ui.h"
 
@@ -722,6 +724,42 @@ static Uint32 g_capture_until = 0;
 static bool capturing()
 {
     return g_capture_until && SDL_GetTicks() < g_capture_until;
+}
+
+// ---------- tab selection (LB/RB) ----------
+//
+// ImGui tab bars have no gamepad binding of their own — L1/R1 are ImGui's
+// window-cycling keys, and the d-pad only walks widgets *inside* the active tab,
+// so reaching a tab meant tapping it. We therefore own the selection: keep the
+// index of the active tab, step it on LB/RB, and force it onto the matching tab
+// with SetSelected for that one frame (forcing every frame would make tapping a
+// tab impossible).
+//
+// The index walks only the tabs actually submitted this frame — hardware-absent
+// tabs are skipped entirely — so it stays dense however the device is equipped.
+
+static int g_tab = 0;         // active tab, as an index into this frame's tabs
+static int g_tab_delta = 0;   // pending LB/RB step, applied at frame start
+static int g_tab_count = 0;   // tabs submitted last frame (the cycle length)
+static int g_tab_seq = 0;     // running index while submitting this frame
+static int g_tab_want = -1;   // index to force this frame; -1 = follow the bar
+
+// Wrap ImGui::BeginTabItem so the tab bar can be built from the same readable
+// `if (has_x && tab_begin("X"))` chain while we track indices behind it.
+//
+// While forcing, g_tab must NOT be updated from the tab that is still open: the
+// old tab is submitted first, so adopting its index here would rewrite the target
+// before the tab we actually want is reached, and its SetSelected would never be
+// applied. g_tab_want is therefore a separate, frame-stable target.
+static bool tab_begin(const char *label)
+{
+    int idx = g_tab_seq++;
+    bool open = ImGui::BeginTabItem(label, nullptr,
+                                    idx == g_tab_want ? ImGuiTabItemFlags_SetSelected : 0);
+    dc_touchlog_item(label);   // KONKR_TOUCH_LOG=1: this tab's real rect vs the tap
+    if (open && g_tab_want < 0)
+        g_tab = idx;   // not forcing: a tap moved the bar, so follow it
+    return open;
 }
 
 static void tab_gamepad(SDL_GameController *gc)
@@ -2539,6 +2577,7 @@ static bool draw_footer(float width, float height)
     if (g_font_small) ImGui::PushFont(g_font_small);
     float line_h = ImGui::GetTextLineHeight() + 5 * u;
     ImGui::SetCursorPos(ImVec2(22 * u, (height - line_h) / 2));
+    dc_hint("LB/RB", "Tab", u);
     dc_hint("A", "Select", u);
     dc_hint("B", "Back", u);
     dc_hint("LB+RB+Start", "Quit", u);
@@ -2646,8 +2685,17 @@ int main(int argc, char **argv)
         // occluded (present returns immediately -> 100% CPU spin)
         Uint32 frame_start = SDL_GetTicks();
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
+        static DcTouchFix touchfix;
+        dc_sdl_batch_begin(touchfix);
+        // dc_sdl_poll, not SDL_PollEvent: a tap's press is held back a frame so a
+        // tab is hovered by the time it lands (see touch_sdl.h).
+        while (dc_sdl_poll(touchfix, &ev)) {
+            // Must run before ImGui sees the event (traces the stream and tracks
+            // the move that dc_sdl_poll keys the hold-back on).
+            bool lifted = dc_sdl_touchify(touchfix, &ev);
             ImGui_ImplSDL2_ProcessEvent(&ev);
+            if (lifted)
+                dc_touch_park();   // stop the tapped widget rendering as hovered
             if (ev.type == SDL_QUIT)
                 quit = true;
             if (ev.type == SDL_KEYDOWN)
@@ -2657,6 +2705,14 @@ int main(int argc, char **argv)
                 int fi = fkey_index(ev.key.keysym.sym);
                 if (fi >= 0)
                     g_fkey[fi] = (ev.type == SDL_KEYDOWN);
+            }
+            // LB/RB cycle tabs. Suppressed while the tester holds the gamepad,
+            // where every button must read as itself.
+            if (ev.type == SDL_CONTROLLERBUTTONDOWN && !capturing()) {
+                if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER)
+                    g_tab_delta--;
+                else if (ev.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)
+                    g_tab_delta++;
             }
         }
         // (re)open the first available controller, e.g. after hotplug
@@ -2694,6 +2750,7 @@ int main(int argc, char **argv)
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
+        dc_imgui_log_frame();   // KONKR_TOUCH_LOG=1: what ImGui made of the input
 
         const ImGuiViewport *vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->WorkPos);
@@ -2711,12 +2768,26 @@ int main(int argc, char **argv)
         const float ftr_h = 48 * g_ui;
         draw_header(vp->WorkSize.x, hdr_h);
 
+        // Apply a pending LB/RB step. ActiveId here is last frame's, so this
+        // skips the step while a slider is being dragged or a combo is open —
+        // there LB/RB belong to the widget, not the tab bar.
+        g_tab_seq = 0;
+        g_tab_want = -1;
+        if (g_tab_delta && g_tab_count > 0 && !ImGui::IsAnyItemActive()) {
+            g_tab = (g_tab + g_tab_delta) % g_tab_count;
+            if (g_tab < 0)
+                g_tab += g_tab_count;
+            g_tab_want = g_tab;   // ImGui applies the switch on the next frame
+        }
+        g_tab_delta = 0;
+
         // content: the tab bar + active tab in its own scrollable region, so the
         // header/footer stay pinned (tab content e.g. the color picker at
         // handheld scale can exceed the screen height)
         ImGui::SetCursorPos(ImVec2(0, hdr_h));
         ImGui::BeginChild("##content", ImVec2(0, vp->WorkSize.y - hdr_h - ftr_h),
                           ImGuiChildFlags_AlwaysUseWindowPadding);
+        dc_touch_scroll();   // finger drag/flick scrolls the tab body
         if (ImGui::BeginTabBar("tabs")) {
             /* Probe device-specific hardware once: this image is shared across
              * SM8750 handhelds, so hide the tabs whose hardware is absent. */
@@ -2728,52 +2799,55 @@ int main(int argc, char **argv)
             static const bool has_wifi = !run_cmd(
                 "ls /sys/class/net 2>/dev/null | grep -m1 ^wlan").empty();
 
-            if (ImGui::BeginTabItem("Gamepad")) {
+            if (tab_begin("Gamepad")) {
                 tab_gamepad(gc);
                 ImGui::EndTabItem();
             }
-            if (has_mcu && ImGui::BeginTabItem("Buttons")) {
+            if (has_mcu && tab_begin("Buttons")) {
                 tab_buttons();
                 ImGui::EndTabItem();
             }
-            if (has_rgb && ImGui::BeginTabItem("RGB")) {
+            if (has_rgb && tab_begin("RGB")) {
                 tab_rgb();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Audio")) {
+            if (tab_begin("Audio")) {
                 tab_audio();
                 ImGui::EndTabItem();
             }
-            if (has_fan && ImGui::BeginTabItem("Fan")) {
+            if (has_fan && tab_begin("Fan")) {
                 tab_fan();
                 ImGui::EndTabItem();
             }
-            if (has_imu && ImGui::BeginTabItem("Motion")) {
+            if (has_imu && tab_begin("Motion")) {
                 tab_motion();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Power")) {
+            if (tab_begin("Power")) {
                 tab_power();
                 ImGui::EndTabItem();
             }
-            if (has_wifi && ImGui::BeginTabItem("Wi-Fi")) {
+            if (has_wifi && tab_begin("Wi-Fi")) {
                 tab_wifi();
                 ImGui::EndTabItem();
             }
-            if (has_steam && ImGui::BeginTabItem("Steam")) {
+            if (has_steam && tab_begin("Steam")) {
                 tab_steam();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("System")) {
+            if (tab_begin("System")) {
                 tab_system();
                 ImGui::EndTabItem();
             }
-            if (ImGui::BeginTabItem("Display")) {
+            if (tab_begin("Display")) {
                 tab_display();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
         }
+        // A hardware-absent tab is never submitted, so the cycle length is
+        // whatever this frame actually built.
+        g_tab_count = g_tab_seq;
         ImGui::EndChild();
 
         ImGui::SetCursorPos(ImVec2(0, vp->WorkSize.y - ftr_h));
@@ -2786,6 +2860,7 @@ int main(int argc, char **argv)
             quit = true;
 
         ImGui::End();
+        dc_imgui_log_endframe();   // KONKR_TOUCH_LOG=1: settled hover/active state
         ImGui::Render();
         SDL_SetRenderDrawColor(ren, (Uint8)(C_BG.x * 255), (Uint8)(C_BG.y * 255),
                                (Uint8)(C_BG.z * 255), 255);

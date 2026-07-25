@@ -85,6 +85,10 @@ static inline void theme_apply_style(float ui)
     st.ItemInnerSpacing  = ImVec2(8 * ui, 6 * ui);
     st.ScrollbarSize     = 12 * ui;
     st.GrabMinSize       = 14 * ui;
+    // Forgive an imprecise finger at a widget's edge. Kept small on purpose:
+    // ImGui does not sort by overlap, so a large pad lets a widget steal taps
+    // aimed at its neighbour.
+    st.TouchExtraPadding = ImVec2(3 * ui, 3 * ui);
     st.IndentSpacing     = 22 * ui;
     st.WindowRounding    = 0;
     st.ChildRounding     = 10 * ui;
