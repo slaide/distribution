@@ -1,0 +1,8 @@
+# KONKR Pocket FIT Elite (SM8750, ath12k/PCIe): keep the WiFi radio out of
+# 802.11 power save while the system is awake. Dynamic PS parks the radio
+# between DTIM beacons and drops/delays inbound packets on an idle device,
+# which makes post-boot SSH intermittently unreachable. This only affects the
+# awake-idle state -- suspend still powers the radio down via the normal
+# PCIe/MHI path, so it costs nothing during sleep. RUN+= re-applies on every
+# interface add (firmware reload / connman bringup) so PS can't creep back on.
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan*", RUN+="/sbin/iw dev %k set power_save off"
