@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2026-present ROCKNIX (https://github.com/ROCKNIX)
+#
+# 050-gamepad-sdl-mapping — KONKR Pocket FIT Elite
+#
+# The SPI gamepad and the MCU system buttons are merged by InputPlumber into
+# its virtual "Microsoft X-Box 360 pad" target. SDL's bundled entry for that
+# virtual pad has the dpad hat directions inverted and no guide/paddle
+# bindings, so the dpad comes out wrong in SDL applications.
+#
+# SDL loads mappings built-in first, then SDL_GAMECONTROLLERCONFIG_FILE, then
+# SDL_GAMECONTROLLERCONFIG; the last entry for a GUID wins. Export the
+# corrected mapping from a profile.d fragment rather than appending it to the
+# database in /storage/.config: chksysconfig rsyncs /usr/config over that
+# directory on update boots, which would silently drop the entry until the
+# next reboot. /usr/config has no profile.d, so a fragment placed here is not
+# overwritten. Device-scoped: no other board's mappings are affected.
+
+FRAG=/storage/.config/profile.d/050-konkr-gamepad-sdl
+MAP="030081b85e0400008e02000001000000,Microsoft Xbox 360,a:b0,b:b1,x:b2,y:b3,back:b6,guide:b8,start:b7,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftshoulder:b4,rightshoulder:b5,leftstick:b9,rightstick:b10,lefttrigger:a2,righttrigger:a5,leftx:a0,lefty:a1,rightx:a3,righty:a4,paddle1:b11,paddle2:b12,paddle3:b13,paddle4:b14,platform:Linux,"
+
+mkdir -p "$(dirname "${FRAG}")"
+cat >"${FRAG}" <<EOF
+# KONKR Pocket FIT Elite: corrected SDL mapping for the InputPlumber xb360 pad.
+# Written by autostart quirk 050-gamepad-sdl-mapping.
+export SDL_GAMECONTROLLERCONFIG="${MAP}"
+EOF
