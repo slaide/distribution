@@ -52,8 +52,8 @@ index dfbbac92242a..dbe838040a67 100644
 +		return -EINVAL;
 +	}
 +
-+	// Extract the last 6 characters
-+	strncpy(last6, serial + serial_len - 6, 6);
++	// Extract the last 6 characters (last6 is zero-initialised, stays NUL-terminated)
++	memcpy(last6, serial + serial_len - 6, 6);
 +
 +	// Initialize the first 3 bytes
 +	bdaddr->b[5] = 0x00;
@@ -225,8 +225,8 @@ index d493ec812055..0e535e96e27b 100644
 +		return -EINVAL;
 +	}
 +
-+	// Extract the last 6 characters
-+	strncpy(last6, serial + serial_len - 6, 6);
++	// Extract the last 6 characters (last6 is zero-initialised, stays NUL-terminated)
++	memcpy(last6, serial + serial_len - 6, 6);
 +
 +	// Initialize the first 3 bytes
 +	macaddr->b[5] = 0x00;
