@@ -5,8 +5,8 @@ Subject: [PATCH 53/54] arm64: dts: qcom: Add AYN CQ8725S Common
 
 Signed-off-by: Teguh Sobirin <teguh@sobir.in>
 ---
- .../boot/dts/qcom/cq8725s-ayn-common.dtsi     | 1237 +++++++++++++++++
- 1 file changed, 1237 insertions(+)
+ .../boot/dts/qcom/cq8725s-ayn-common.dtsi     | 1259 +++++++++++++++++
+ 1 file changed, 1259 insertions(+)
  create mode 100644 arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi
 
 diff --git a/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi b/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi
@@ -14,7 +14,7 @@ new file mode 100644
 index 000000000000..6090b5b3c668
 --- /dev/null
 +++ b/arch/arm64/boot/dts/qcom/cq8725s-ayn-common.dtsi
-@@ -0,0 +1,1237 @@
+@@ -0,0 +1,1259 @@
 +// SPDX-License-Identifier: BSD-3-Clause
 +/*
 + * Copyright (c) 2026 Teguh Sobirin.
@@ -191,6 +191,28 @@ index 000000000000..6090b5b3c668
 +
 +			cpu {
 +				sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
++
++		/* HDMI audio out over USB-C DP alt mode. Codec side is the
++		 * hdmi-codec the DP bridge registers under &mdss_dp0, and this
++		 * link is what makes the machine driver create the "DP0 Jack"
++		 * control that UCM keys the HDMI device off. Needs the
++		 * DISPLAY_PORT_RX_0 graph in the topology blob.
++		 */
++		dp-dai-link {
++			link-name = "DisplayPort Playback";
++
++			codec {
++				sound-dai = <&mdss_dp0>;
++			};
++
++			cpu {
++				sound-dai = <&q6apmbedai DISPLAY_PORT_RX_0>;
 +			};
 +
 +			platform {
